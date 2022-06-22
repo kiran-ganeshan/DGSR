@@ -31,7 +31,7 @@ def neg_generate(user, data_neg, neg_num=100):
     return neg
 
 
-class myFloder(Dataset):
+class StaticData(Dataset):
     def __init__(self, root_dir, loader):
         self.root = root_dir
         self.loader = loader

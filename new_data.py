@@ -16,16 +16,16 @@ import os
 from dgl import save_graphs
 from joblib import Parallel, delayed
 
-# 计算item序列的相对次序
+# Calculate the relative order of the item sequence
 def cal_order(data):
     data = data.sort_values(['time'], kind='mergesort')
-    data['order'] = range(len(data))
+    data['item_id'] = range(len(data))
     return data
 
-# 计算user序列的相对次序
+# Calculate the relative order of the user sequence
 def cal_u_order(data):
     data = data.sort_values(['time'], kind='mergesort')
-    data['u_order'] = range(len(data))
+    data['user_id'] = range(len(data))
     return data
 
 def refine_time(data):
@@ -40,9 +40,19 @@ def refine_time(data):
     return  data
 
 def generate_graph(data):
+    print(f"unique user ids: {len(data['user_id'].unique())}")
+    print(f"unique item ids: {len(data['item_id'].unique())}")
     data = data.groupby('user_id').apply(refine_time).reset_index(drop=True)
     data = data.groupby('user_id').apply(cal_order).reset_index(drop=True)
     data = data.groupby('item_id').apply(cal_u_order).reset_index(drop=True)
+    user_ids = data['user_id'].unique()
+    item_ids = data['item_id'].unique()
+    user_ids.sort()
+    item_ids.sort()
+    
+    print(user_ids[:5], user_ids[-5:])
+    
+    print(item_ids[:5], item_ids[-5:])
     user = data['user_id'].values
     item = data['item_id'].values
     time = data['time'].values
@@ -51,14 +61,8 @@ def generate_graph(data):
     graph = dgl.heterograph(graph_data)
     graph.edges['by'].data['time'] = torch.LongTensor(time)
     graph.edges['pby'].data['time'] = torch.LongTensor(time)
-    #graph.edges['by'].data['t'] = torch.tensor(data['order'])
-    # graph.edges['by'].data['rt'] = torch.tensor(data['re_order'])
-    # graph.edges['pby'].data['t'] = torch.tensor(data['u_order'])
-    #graph.edges['pby'].data['rt'] = torch.tensor(data['u_re_order'])
     graph.nodes['user'].data['user_id'] = torch.LongTensor(np.unique(user))
     graph.nodes['item'].data['item_id'] = torch.LongTensor(np.unique(item))
-    # graph.nodes['item'].data['last_user'] = torch.tensor(data['u_last'])
-    # graph.nodes['user'].data['last_item'] = torch.tensor(data['last'])
     return graph
 
 
@@ -66,104 +70,58 @@ def generate_user(user, data, graph, item_max_length, user_max_length, train_pat
     data_user = data[data['user_id'] == user].sort_values('time')
     u_time = data_user['time'].values
     u_seq = data_user['item_id'].values
-    split_point = len(u_seq) - 1
-    train_num = 0
-    test_num = 0
-    # 生成训练数据
+    train_num, test_num = 0, 0
+    # generate training data
     if len(u_seq) < 3:
-        return 0, 0
-    else:
-        for j, t  in enumerate(u_time[0:-1]):
-            if j == 0:
-                continue
-            if j < item_max_length:
-                start_t = u_time[0]
-            else:
-                start_t = u_time[j - item_max_length]
-            sub_u_eid = (graph.edges['by'].data['time'] < u_time[j+1]) & (graph.edges['by'].data['time'] >= start_t)
-            sub_i_eid = (graph.edges['pby'].data['time'] < u_time[j+1]) & (graph.edges['pby'].data['time'] >= start_t)
-            sub_graph = dgl.edge_subgraph(graph, edges = {'by':sub_u_eid, 'pby':sub_i_eid}, relabel_nodes=False)
-            u_temp = torch.tensor([user])
-            his_user = torch.tensor([user])
-            graph_i = select_topk(sub_graph, item_max_length, weight='time', nodes={'user':u_temp})
-            i_temp = torch.unique(graph_i.edges(etype='by')[0])
-            his_item = torch.unique(graph_i.edges(etype='by')[0])
-            edge_i = [graph_i.edges['by'].data[dgl.NID]]
-            edge_u = []
-            for _ in range(k_hop-1):
+        return train_num, test_num
+    for j, t  in enumerate(u_time[1:-1]):
+        # remove edges that are too new or old
+        start_t = u_time[max(j - item_max_length, 0)]
+        end_t = u_time[j + 1]
+        sub_u_eid = (graph.edges['by'].data['time'] < end_t) & (graph.edges['by'].data['time'] >= start_t)
+        sub_i_eid = (graph.edges['pby'].data['time'] < end_t) & (graph.edges['pby'].data['time'] >= start_t)
+        sub_graph = dgl.edge_subgraph(graph, edges = {'by':sub_u_eid, 'pby':sub_i_eid}, relabel_nodes=False)
+        u_temp, i_temp = torch.tensor([user]), torch.tensor([])
+        his_user, his_item = torch.tensor([user]), torch.tensor([])
+        edge_u, edge_i = [], []
+        for hop in range(k_hop):
+            if hop > 0:
                 graph_u = select_topk(sub_graph, user_max_length, weight='time', nodes={'item': i_temp})  # item的邻居user
                 u_temp = np.setdiff1d(torch.unique(graph_u.edges(etype='pby')[0]), his_user)[-user_max_length:]
-                #u_temp = torch.unique(torch.cat((u_temp, graph_u.edges(etype='pby')[0])))
-                graph_i = select_topk(sub_graph, item_max_length, weight='time', nodes={'user': u_temp})
                 his_user = torch.unique(torch.cat([torch.tensor(u_temp), his_user]))
-                #i_temp = torch.unique(torch.cat((i_temp, graph_i.edges(etype='by')[0])))
-                i_temp = np.setdiff1d(torch.unique(graph_i.edges(etype='by')[0]), his_item)
-                his_item = torch.unique(torch.cat([torch.tensor(i_temp), his_item]))
-                edge_i.append(graph_i.edges['by'].data[dgl.NID])
                 edge_u.append(graph_u.edges['pby'].data[dgl.NID])
-            all_edge_u = torch.unique(torch.cat(edge_u))
-            all_edge_i = torch.unique(torch.cat(edge_i))
-            fin_graph = dgl.edge_subgraph(sub_graph, edges={'by':all_edge_i,'pby':all_edge_u})
-            target = u_seq[j+1]
-            last_item = u_seq[j]
-            u_alis = torch.where(fin_graph.nodes['user'].data['user_id']==user)[0]
-            last_alis = torch.where(fin_graph.nodes['item'].data['item_id']==last_item)[0]
-            # 分别计算user和last_item在fin_graph中的索引
-            if j < split_point-1:
-                save_graphs(train_path+ '/' + str(user) + '/'+ str(user) + '_' + str(j) + '.bin', fin_graph,
-                            {'user': torch.tensor([user]), 'target': torch.tensor([target]), 'u_alis':u_alis, 'last_alis': last_alis})
-                train_num += 1
-            if j == split_point - 1 - 1:
-                save_graphs(val_path + '/' + str(user) + '/' + str(user) + '_' + str(j) + '.bin', fin_graph,
-                            {'user': torch.tensor([user]), 'target': torch.tensor([target]), 'u_alis': u_alis,
-                             'last_alis': last_alis})
-            if j == split_point - 1:
-                save_graphs(test_path + '/' + str(user) + '/' + str(user) + '_' + str(j) + '.bin', fin_graph,
-                            {'user': torch.tensor([user]), 'target': torch.tensor([target]), 'u_alis':u_alis, 'last_alis': last_alis})
-                test_num += 1
-        return train_num, test_num
+            graph_i = select_topk(sub_graph, item_max_length, weight='time', nodes={'user': u_temp})
+            i_temp = np.setdiff1d(torch.unique(graph_i.edges(etype='by')[0]), his_item)
+            his_item = torch.unique(torch.cat([torch.tensor(i_temp), his_item]))
+            edge_i.append(graph_i.edges['by'].data[dgl.NID])
+        all_edge_u = torch.unique(torch.cat(edge_u))
+        all_edge_i = torch.unique(torch.cat(edge_i))
+        fin_graph = dgl.edge_subgraph(sub_graph, edges={'by':all_edge_i,'pby':all_edge_u})
+        target = u_seq[j+1]
+        last_item = u_seq[j]
+        u_alis = torch.where(fin_graph.nodes['user'].data['user_id']==user)[0]
+        last_alis = torch.where(fin_graph.nodes['item'].data['item_id']==last_item)[0]
+       
+        # save graphs
+        rel_path = '/' + str(user) + '/'+ str(user) + '_' + str(j) + '.bin'
+        labels = {'user': torch.tensor([user]), 'target': torch.tensor([target]), 
+                  'u_alis': u_alis, 'last_alis': last_alis}
+        if j < len(u_time) - 3: # reserve last point for testing
+            save_graphs(train_path + rel_path, fin_graph, labels)
+            if j == len(u_time) - 4:
+                save_graphs(val_path + rel_path, fin_graph, labels)
+            train_num += 1
+        else:
+            save_graphs(test_path + rel_path, fin_graph, labels)
+            test_num += 1
+    return train_num, test_num
 
 
 def generate_data(data, graph, item_max_length, user_max_length, train_path, test_path, val_path, job=10, k_hop=3):
     user = data['user_id'].unique()
-    a = Parallel(n_jobs=job)(delayed(lambda u: generate_user(u, data, graph, item_max_length, user_max_length, train_path, test_path, k_hop, val_path))(u) for u in user)
-    return a
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data', default='sample', help='data name: sample')
-    parser.add_argument('--graph', action='store_true', help='no_batch')
-    parser.add_argument('--item_max_length', type=int, default=50, help='most recent')
-    parser.add_argument('--user_max_length', type=int, default=50, help='most recent')
-    parser.add_argument('--job', type=int, default=10, help='number of epochs to train for')
-    parser.add_argument('--k_hop', type=int, default=2, help='k_hop')
-    opt = parser.parse_args()
-    data_path = './Data/' + opt.data + '.csv'
-    graph_path = './Data/' + opt.data + '_graph'
-    data = pd.read_csv(data_path).groupby('user_id').apply(refine_time).reset_index(drop=True)
-    data['time'] = data['time'].astype('int64')
-    # if opt.graph:
-    #     graph = generate_graph(data)
-    #     save_graphs(graph_path, graph)
-    # else:
-    if not os.path.exists(graph_path):
-        graph = generate_graph(data)
-        save_graphs(graph_path, graph)
-    else:
-        graph = dgl.load_graphs(graph_path)[0][0]
-    train_path = f'Newdata/{opt.data}_{opt.item_max_length}_{opt.user_max_length}_{opt.k_hop}/train/'
-    val_path = f'Newdata/{opt.data}_{opt.item_max_length}_{opt.user_max_length}_{opt.k_hop}/val/'
-    test_path = f'Newdata/{opt.data}_{opt.item_max_length}_{opt.user_max_length}_{opt.k_hop}/test/'
-    #generate_user(41, data, graph, opt.item_max_length, opt.user_max_length, train_path, test_path, k_hop=opt.k_hop)
-    print('start:', datetime.datetime.now())
-    all_num = generate_data(data, graph, opt.item_max_length, opt.user_max_length, train_path, test_path, val_path, job=opt.job, k_hop=opt.job)
-    train_num = 0
-    test_num = 0
-    for num_ in all_num:
-        train_num += num_[0]
-        test_num += num_[1]
-    print('The number of train set:', train_num)
-    print('The number of test set:', test_num)
-    print('end:', datetime.datetime.now())
+    generate_func = lambda u: generate_user(u, data, graph, item_max_length, user_max_length, 
+                                            train_path, test_path, k_hop, val_path)
+    a = Parallel(n_jobs=job)(delayed(generate_func)(u) for u in user)
+    return tuple([sum(tup) for tup in zip(*a)])
 
 
