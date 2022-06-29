@@ -16,17 +16,13 @@ import os
 from dgl import save_graphs
 from joblib import Parallel, delayed
 
-# Calculate the relative order of the item sequence
-def cal_order(data):
-    data = data.sort_values(['time'], kind='mergesort')
-    data['item_id'] = range(len(data))
-    return data
-
-# Calculate the relative order of the user sequence
-def cal_u_order(data):
-    data = data.sort_values(['time'], kind='mergesort')
-    data['user_id'] = range(len(data))
-    return data
+# Replace user and item ids with their relative orders
+def order(data, key):
+    user_ids = np.unique(data[key])
+    order = {k: v for k, v in zip(user_ids, range(len(user_ids)))}
+    reverse = {v: k for k, v in order.items()}
+    data[key] = data[key].apply(lambda id: order[id])
+    return data, reverse
 
 def refine_time(data):
     data = data.sort_values(['time'], kind='mergesort')
@@ -39,20 +35,13 @@ def refine_time(data):
     data['time'] = time_seq
     return  data
 
-def generate_graph(data):
-    print(f"unique user ids: {len(data['user_id'].unique())}")
-    print(f"unique item ids: {len(data['item_id'].unique())}")
+def preprocess_data(data):
+    data, u_reverse = order(data, 'user_id')
+    data, i_reverse = order(data, 'item_id')
     data = data.groupby('user_id').apply(refine_time).reset_index(drop=True)
-    data = data.groupby('user_id').apply(cal_order).reset_index(drop=True)
-    data = data.groupby('item_id').apply(cal_u_order).reset_index(drop=True)
-    user_ids = data['user_id'].unique()
-    item_ids = data['item_id'].unique()
-    user_ids.sort()
-    item_ids.sort()
-    
-    print(user_ids[:5], user_ids[-5:])
-    
-    print(item_ids[:5], item_ids[-5:])
+    return data, u_reverse, i_reverse
+
+def generate_graph(data):
     user = data['user_id'].values
     item = data['item_id'].values
     time = data['time'].values
@@ -118,10 +107,11 @@ def generate_user(user, data, graph, item_max_length, user_max_length, train_pat
 
 
 def generate_data(data, graph, item_max_length, user_max_length, train_path, test_path, val_path, job=10, k_hop=3):
+    print('start data generation:', datetime.datetime.now(), flush=True)
     user = data['user_id'].unique()
     generate_func = lambda u: generate_user(u, data, graph, item_max_length, user_max_length, 
                                             train_path, test_path, k_hop, val_path)
-    a = Parallel(n_jobs=job)(delayed(generate_func)(u) for u in user)
+    a = Parallel(n_jobs=1)(delayed(generate_func)(u) for u in user)
     return tuple([sum(tup) for tup in zip(*a)])
 
 

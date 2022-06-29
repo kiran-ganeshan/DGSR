@@ -27,7 +27,7 @@ def user_neg(data, item_num):
 def neg_generate(user, data_neg, neg_num=100):
     neg = np.zeros((len(user), neg_num), np.int32)
     for i, u in enumerate(user):
-        neg[i] = np.random.choice(data_neg[u], neg_num, replace=False)
+        neg[i] = np.random.choice(data_neg[u.item()], neg_num)
     return neg
 
 
@@ -49,15 +49,21 @@ class StaticData(Dataset):
 
 def collate(data):
     user = []
+    user_l = []
     graph = []
-    last_item = []
     label = []
-    for da in data:
-        user.append(da[0])
-        graph.append(da[1])
-        last_item.append(da[2])
-        label.append(da[3])
-    return torch.Tensor(user).long(), dgl.batch_hetero(graph), torch.Tensor(last_item).long(), torch.Tensor(label).long()
+    last_item = []
+    for graphs, labels in data:
+        user.append(labels['user'])
+        user_l.append(labels['u_alis'])
+        graph.append(graphs[0])
+        label.append(labels['target'])
+        last_item.append(labels['last_alis'])
+    user_l = torch.tensor(user_l).long()
+    graph = dgl.batch(graph)
+    label = torch.tensor(label).long()
+    last_item = torch.tensor(last_item).long()
+    return user_l, graph, label, last_item
 
 
 def load_data(data_path):
@@ -72,21 +78,10 @@ def load_data(data_path):
 
 def collate_test(data, user_neg):
     # 生成负样本和每个序列的长度
-    user_alis = []
-    graph = []
-    last_item = []
-    label = []
-    user = []
-    length = []
-    for da in data:
-        user_alis.append(da[0])
-        graph.append(da[1])
-        last_item.append(da[2])
-        label.append(da[3])
-        user.append(da[4])
-        length.append(da[5])
-    return torch.Tensor(user_alis).long(), dgl.batch_hetero(graph), torch.Tensor(last_item).long(), \
-           torch.Tensor(label).long(), torch.Tensor(length).long(), torch.Tensor(neg_generate(user, user_neg)).long()
+    user, graph, label, last_item = collate(data)
+    neg = neg_generate(user, user_neg)
+    neg = torch.tensor(neg).long()
+    return user, graph, label, last_item, neg
 
 
 def trans_to_cuda(variable):
@@ -96,73 +91,33 @@ def trans_to_cuda(variable):
         return variable
 
 
-def eval_metric(all_top, all_label, all_length, random_rank=True):
+def eval_metric(all_top, random_rank=True):
     recall5, recall10, recall20, ndgg5, ndgg10, ndgg20 = [], [], [], [], [], []
     data_l = np.zeros((100, 7))
     for index in range(len(all_top)):
-        per_length = all_length[index]
-        if random_rank:
-            prediction = (-all_top[index]).argsort(1).argsort(1)
-            predictions = prediction[:, 0]
-            for i, rank in enumerate(predictions):
-                # data_l[per_length[i], 6] += 1
-                if rank < 20:
-                    ndgg20.append(1 / np.log2(rank + 2))
-                    recall20.append(1)
-                    # if per_length[i]-1 < 100:
-                    #     data_l[per_length[i], 5] += 1 / np.log2(rank + 2)
-                    #     data_l[per_length[i], 2] += 1
-                    # else:
-                    #     data_l[99, 5] += 1 / np.log2(rank + 2)
-                    #     data_l[99, 2] += 1
-                else:
-                    ndgg20.append(0)
-                    recall20.append(0)
-                if rank < 10:
-                    ndgg10.append(1 / np.log2(rank + 2))
-                    recall10.append(1)
-                    # if per_length[i]-1 < 100:
-                    #     data_l[per_length[i], 4] += 1 / np.log2(rank + 2)
-                    #     data_l[per_length[i], 1] += 1
-                    # else:
-                    #     data_l[99, 4] += 1 / np.log2(rank + 2)
-                    #     data_l[99, 1] += 1
-                else:
-                    ndgg10.append(0)
-                    recall10.append(0)
-                if rank < 5:
-                    ndgg5.append(1 / np.log2(rank + 2))
-                    recall5.append(1)
-                    # if per_length[i]-1 < 100:
-                    #     data_l[per_length[i], 3] += 1 / np.log2(rank + 2)
-                    #     data_l[per_length[i], 0] += 1
-                    # else:
-                    #     data_l[99, 3] += 1 / np.log2(rank + 2)
-                    #     data_l[99, 0] += 1
-                else:
-                    ndgg5.append(0)
-                    recall5.append(0)
-
-        else:
-            for top_, target in zip(all_top[index], all_label[index]):
-                recall20.append(np.isin(target, top_))
-                recall10.append(np.isin(target, top_[0:10]))
-                recall5.append(np.isin(target, top_[0:5]))
-                if len(np.where(top_ == target)[0]) == 0:
-                    ndgg20.append(0)
-                else:
-                    ndgg20.append(1 / np.log2(np.where(top_ == target)[0][0] + 2))
-                if len(np.where(top_ == target)[0]) == 0:
-                    ndgg10.append(0)
-                else:
-                    ndgg10.append(1 / np.log2(np.where(top_ == target)[0][0] + 2))
-                if len(np.where(top_ == target)[0]) == 0:
-                    ndgg5.append(0)
-                else:
-                    ndgg5.append(1 / np.log2(np.where(top_ == target)[0][0] + 2))
-    #pd.DataFrame(data_l, columns=['r5','r10','r20','n5','n10','n10','number']).to_csv(name+'.csv')
-    return np.mean(recall5), np.mean(recall10), np.mean(recall20), np.mean(ndgg5), np.mean(ndgg10), np.mean(ndgg20), \
-           pd.DataFrame(data_l, columns=['r5','r10','r20','n5','n10','n20','number'])
+        prediction = (-all_top[index]).argsort(1).argsort(1)
+        predictions = prediction[:, 0]
+        for i, rank in enumerate(predictions):
+            # data_l[per_length[i], 6] += 1
+            if rank < 20:
+                ndgg20.append(1 / np.log2(rank + 2))
+                recall20.append(1)
+            else:
+                ndgg20.append(0)
+                recall20.append(0)
+            if rank < 10:
+                ndgg10.append(1 / np.log2(rank + 2))
+                recall10.append(1)
+            else:
+                ndgg10.append(0)
+                recall10.append(0)
+            if rank < 5:
+                ndgg5.append(1 / np.log2(rank + 2))
+                recall5.append(1)
+            else:
+                ndgg5.append(0)
+                recall5.append(0)
+    return np.mean(recall5), np.mean(recall10), np.mean(recall20), np.mean(ndgg5), np.mean(ndgg10), np.mean(ndgg20)
 
 
 
@@ -188,3 +143,12 @@ def format_arg_str(args, exclude_lst, max_len=20):
                        + value + ' ' * (value_max_len - len(value)) + linesep
     res_str += '=' * horizon_len
     return res_str
+
+
+def mkdir_if_not_exist(file_name):
+    import os
+    import shutil
+
+    dir_name = os.path.dirname(file_name)
+    if not os.path.isdir(dir_name):
+        os.makedirs(dir_name)
