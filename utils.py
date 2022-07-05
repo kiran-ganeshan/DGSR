@@ -5,30 +5,27 @@
 # @File : utils.py
 # @Software: PyCharm
 import os
-from torch.utils.data import Dataset, DataLoader
-import _pickle as cPickle
+from torch.utils.data import Dataset
 import dgl
 import torch
 import numpy as np
-import pandas as pd
+from torch.nn.functional import one_hot
 
-
-
-def pickle_loader(path):
-    a = cPickle.load(open(path, 'rb'))
-    return a
 
 def user_neg(data, item_num):
-    item = range(item_num)
-    def select(data_u, item):
-        return np.setdiff1d(item, data_u)
-    return data.groupby('user_id')['item_id'].apply(lambda x: select(x, item))
+    all_item = range(item_num)
+    u_item = data.groupby('user_id')['item_id']
+    return u_item.apply(lambda x: np.setdiff1d(all_item, x))
 
-def neg_generate(user, data_neg, neg_num=100):
+def neg_generate(user, label, data_neg, neg_num=100):
     neg = np.zeros((len(user), neg_num), np.int32)
+    # find first idx along last dim of label to be -1
+    first_idx = torch.argmax((label == -1) * torch.arange(label.shape[1], 0, -1), -1)
     for i, u in enumerate(user):
         neg[i] = np.random.choice(data_neg[u.item()], neg_num)
-    return neg
+        label[i, first_idx[i]:] = np.random.choice(data_neg[u.item()], label.shape[1] - first_idx[i])
+    neg = torch.cat([label, torch.tensor(neg).long()], -1)
+    return neg, first_idx
 
 
 class StaticData(Dataset):
@@ -48,21 +45,19 @@ class StaticData(Dataset):
 
 
 def collate(data):
-    user = []
     user_l = []
     graph = []
     label = []
     last_item = []
     for graphs, labels in data:
-        user.append(labels['user'])
         user_l.append(labels['u_alis'])
         graph.append(graphs[0])
         label.append(labels['target'])
         last_item.append(labels['last_alis'])
     user_l = torch.tensor(user_l).long()
     graph = dgl.batch(graph)
-    label = torch.tensor(label).long()
-    last_item = torch.tensor(last_item).long()
+    label = torch.cat(label)
+    last_item = torch.cat(last_item).long()
     return user_l, graph, label, last_item
 
 
@@ -70,79 +65,41 @@ def load_data(data_path):
     data_dir = []
     dir_list = os.listdir(data_path)
     dir_list.sort()
-    for filename in dir_list:
-        for fil in os.listdir(os.path.join(data_path, filename)):
-            data_dir.append(os.path.join(os.path.join(data_path, filename), fil))
+    for name in dir_list:
+        folder = os.path.join(data_path, name)
+        for file in os.listdir(folder):
+            data_dir.append(os.path.join(folder, file))
     return data_dir
 
-
-def collate_test(data, user_neg):
-    # 生成负样本和每个序列的长度
-    user, graph, label, last_item = collate(data)
-    neg = neg_generate(user, user_neg)
-    neg = torch.tensor(neg).long()
-    return user, graph, label, last_item, neg
-
-
-def trans_to_cuda(variable):
-    if torch.cuda.is_available():
-        return variable.cuda()
-    else:
-        return variable
+def get_collate_test(use_hinge, item_num):
+    def collate_test(data, user_neg):
+        # generate negative samples
+        user, graph, label, last_item = collate(data)
+        all, neg_idx = neg_generate(user, label, user_neg)
+        if not use_hinge:
+            label = one_hot(label, num_classes=item_num).sum(-2).float()
+        return user, graph, label, last_item, all, neg_idx
+    return collate_test
 
 
-def eval_metric(all_top, random_rank=True):
-    recall5, recall10, recall20, ndgg5, ndgg10, ndgg20 = [], [], [], [], [], []
-    data_l = np.zeros((100, 7))
-    for index in range(len(all_top)):
-        prediction = (-all_top[index]).argsort(1).argsort(1)
-        predictions = prediction[:, 0]
-        for i, rank in enumerate(predictions):
-            # data_l[per_length[i], 6] += 1
-            if rank < 20:
-                ndgg20.append(1 / np.log2(rank + 2))
-                recall20.append(1)
-            else:
-                ndgg20.append(0)
-                recall20.append(0)
-            if rank < 10:
-                ndgg10.append(1 / np.log2(rank + 2))
-                recall10.append(1)
-            else:
-                ndgg10.append(0)
-                recall10.append(0)
-            if rank < 5:
-                ndgg5.append(1 / np.log2(rank + 2))
-                recall5.append(1)
-            else:
-                ndgg5.append(0)
-                recall5.append(0)
-    return np.mean(recall5), np.mean(recall10), np.mean(recall20), np.mean(ndgg5), np.mean(ndgg10), np.mean(ndgg20)
+def eval_metric(all_scores, neg_idxs, ats=[5, 10, 20]):
+    recalls = {at: [] for at in ats}
+    ndcgs = {at: [] for at in ats}
+    for scores, neg_idx in zip(all_scores, neg_idxs):
+        prediction = (-scores).argsort(1).argsort(1)
+        for i, ranks in enumerate(prediction):
+            for rank in ranks[:neg_idx[i]]:
+                for at in ats:
+                    if rank < at:
+                        ndcgs[at].append(1 / np.log2(rank + 2))
+                        recalls[at].append(1)
+                    else:
+                        ndcgs[at].append(0)
+                        recalls[at].append(0)
+    recalls = {'recall@' + at: np.mean(lst) for at, lst in recalls.items()}
+    ndcgs = {'ndcg@' + at: np.mean(lst) for at, lst in ndcgs.items()}
+    return {**recalls, **ndcgs}
 
-
-
-def format_arg_str(args, exclude_lst, max_len=20):
-    linesep = os.linesep
-    arg_dict = vars(args)
-    keys = [k for k in arg_dict.keys() if k not in exclude_lst]
-    values = [arg_dict[k] for k in keys]
-    key_title, value_title = 'Arguments', 'Values'
-    key_max_len = max(map(lambda x: len(str(x)), keys))
-    value_max_len = min(max(map(lambda x: len(str(x)), values)), max_len)
-    key_max_len, value_max_len = max([len(key_title), key_max_len]), max([len(value_title), value_max_len])
-    horizon_len = key_max_len + value_max_len + 5
-    res_str = linesep + '=' * horizon_len + linesep
-    res_str += ' ' + key_title + ' ' * (key_max_len - len(key_title)) + ' | ' \
-               + value_title + ' ' * (value_max_len - len(value_title)) + ' ' + linesep + '=' * horizon_len + linesep
-    for key in sorted(keys):
-        value = arg_dict[key]
-        if value is not None:
-            key, value = str(key), str(value).replace('\t', '\\t')
-            value = value[:max_len-3] + '...' if len(value) > max_len else value
-            res_str += ' ' + key + ' ' * (key_max_len - len(key)) + ' | ' \
-                       + value + ' ' * (value_max_len - len(value)) + linesep
-    res_str += '=' * horizon_len
-    return res_str
 
 
 def mkdir_if_not_exist(file_name):

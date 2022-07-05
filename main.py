@@ -17,21 +17,22 @@ import warnings
 import argparse
 import os
 import sys
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 import torch.optim as optim
 import torch.nn as nn
-from time import sleep
-from utils import user_neg, eval_metric, mkdir_if_not_exist, collate, collate_test
+from utils import user_neg, eval_metric, mkdir_if_not_exist, collate, collate_test, get_multihot_label
 from preprocess import generate_graph, save_graphs, generate_data, preprocess_data
 
 
 warnings.filterwarnings('ignore')
 parser = argparse.ArgumentParser()
 parser.add_argument('--data', default='Beauty', help='data name: sample')
+parser.add_argument('--load', type=str, default=None, help='past model to load (default: from scratch)')
 parser.add_argument('--batchSize', type=int, default=1024, help='input batch size')
 parser.add_argument('--hidden_size', type=int, default=50, help='hidden state size')
+parser.add_argument("--use_hinge", action='store_true', default=False, help='use multiclass hinge instead of cross entropy')
 parser.add_argument('--epoch', type=int, default=30, help='number of epochs to train for')
-parser.add_argument('--lr', type=float, default=0.002, help='learning rate')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--l2', type=float, default=0.0001, help='l2 penalty')
 parser.add_argument('--feat_drop', type=float, default=0.3, help='drop_out')
 parser.add_argument('--attn_drop', type=float, default=0.3, help='drop_out')
@@ -43,6 +44,7 @@ parser.add_argument('--gpu', default='2')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--debug", action='store_true', default=False, help='debug mode (model not saved)')
 
+
 opt = parser.parse_args()
 args, extras = parser.parse_known_args()
 device = torch.device(f'cuda:{opt.gpu}')
@@ -51,7 +53,7 @@ print(f"device: {device}")
 print(f"opt: {opt}")
 
 # loading data (and preprocessing if necessary)
-data_id = f"{opt.data}_{opt.item_max_length}_{opt.user_max_length}_{opt.k_hop}"
+data_id = f"{opt.data}_{opt.item_max_length}_{opt.user_max_length}_{opt.k_hop}_{opt.use_hinge}"
 run_id = f"bs{opt.batchSize}_lr{opt.lr}_epoch{opt.epoch}"
 data_path = 'static/' + data_id + '/'
 train_path = data_path + 'train/'
@@ -95,8 +97,8 @@ def preprocess():
         graph = dgl.load_graphs(graph_path)[0][0]
         
     # data
-    train_num, test_num = generate_data(data, graph, opt.item_max_length, opt.user_max_length, 
-                                        train_path, test_path, val_path, job=opt.epoch, k_hop=opt.k_hop)
+    train_num, test_num = generate_data(data, graph, metadata['item_num'], opt.item_max_length, opt.user_max_length, 
+                                        train_path, test_path, val_path, job=opt.epoch, k_hop=opt.k_hop, use_hinge=opt.use_hinge)
     
     # save metadata (last to indicate completion)
     with open(metadata_path, 'wb') as file:
@@ -136,10 +138,12 @@ if opt.val:
 model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, item_max_length=opt.item_max_length,
              user_max_length=opt.user_max_length, feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, 
              layer_num=opt.layer_num).cuda()
+if opt.load:
+    state = torch.load(out_folder + 'model_' + opt.load)
+    model.load_state_dict(state)
 optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.l2)
-loss_func = nn.CrossEntropyLoss()
-best_result = [0, 0, 0, 0, 0, 0]   # hit5,hit10,hit20,mrr5,mrr10,mrr20
-best_epoch = [0, 0, 0, 0, 0, 0]
+loss_func = nn.MultiLabelMarginLoss() if opt.use_hinge else nn.BCEWithLogitsLoss()
+best = {}
 stop_num = 0
 epoch_start = None
 for epoch in range(opt.epoch):
@@ -158,6 +162,7 @@ for epoch in range(opt.epoch):
     for user, batch_graph, label, last_item in train_data:
         iter += 1
         score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), is_training=True)
+        print(label.dtype, flush=True)
         loss = loss_func(score, label.cuda())
         optimizer.zero_grad()
         loss.backward()
@@ -172,83 +177,46 @@ for epoch in range(opt.epoch):
     model.eval()
     if opt.val:
         print('start validation: ', datetime.datetime.now())
-        val_loss_all, top_val = [], []
+        val_losses, all_scores, neg_idxs = [], [], []
         with torch.no_grad:
-            for user, batch_graph, label, last_item, neg_tar in val_data:
-                score, top = model(batch_graph.to(device), user.cuda(), last_item.cuda(), neg_tar=torch.cat([label.unsqueeze(1), neg_tar], -1).cuda(), is_training=False)
+            for user, batch_graph, label, last_item, all, neg_idx in val_data:
+                score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), neg_tar=all.cuda(), is_training=False)
                 val_loss = loss_func(score, label.cuda())
-                val_loss_all.append(val_loss.append(val_loss.item()))
-                top_val.append(top.detach().cpu().numpy())
-            recall5, recall10, recall20, ndgg5, ndgg10, ndgg20 = eval_metric(top_val)
-            print('\ttrain_loss:%.4f \
-                   \n\tval_loss:%.4f \
-                   \n\tRecall@5:%.4f \
-                   \n\tRecall@10:%.4f \
-                   \n\tRecall@20:%.4f \
-                   \n\tNDGG@5:%.4f \
-                   \n\tNDGG10@10:%.4f \
-                   \n\tNDGG@20:%.4f' %
-                  (epoch_loss, np.mean(val_loss_all), recall5, recall10, recall20, ndgg5, ndgg10, ndgg20))
+                val_losses.append(val_loss.item())
+                all_scores.append(all_score.detach().cpu().numpy())
+                neg_idxs.append(neg_idx.numpy())
+            results = eval_metric(all_scores, neg_idxs)
+            results_str = sum([f"\n\t{metric_name}: {val:.4f}" for metric_name, val in results])
+            print(f"\ttrain_loss:{epoch_loss:.4f} \
+                   \n\tval_loss:{np.mean(val_losses):.4f}" + results_str)
     ###############################################################
     
     ############################ test ############################
     print('start testing: ', datetime.datetime.now())
-    all_top, all_label, all_length = [], [], []
-    all_loss = []
+    losses, all_scores, neg_idxs = [], [], []
     iter = 0
-    for user, batch_graph, label, last_item, neg_tar in test_data:
+    for user, batch_graph, label, last_item, all, neg_idx in test_data:
         iter += 1
         with torch.no_grad():
-            score, top = model(batch_graph.to(device), user.cuda(), last_item.cuda(), neg_tar=torch.cat([label.unsqueeze(1), neg_tar],-1).cuda(),  is_training=False)
+            score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), neg_tar=all.cuda(), is_training=False)
             test_loss = loss_func(score, label.cuda())
-            all_loss.append(test_loss.item())
-            all_top.append(top.detach().cpu().numpy())
-            all_label.append(label.numpy())
-            if (iter + 1) % 200 == 0:
-                print('\tIter {}, test_loss {:.4f}'.format(iter + 1, np.mean(all_loss)), datetime.datetime.now())
-        recall5, recall10, recall20, ndgg5, ndgg10, ndgg20 = eval_metric(all_top)
-        if recall5 > best_result[0]:
-            best_result[0] = recall5
-            best_epoch[0] = epoch
-            stop = False
-        if recall10 > best_result[1]:
-            if not opt.debug:
-                torch.save(model.state_dict(), model_file + '.pkl')
-            best_result[1] = recall10
-            best_epoch[1] = epoch
-            stop = False
-        if recall20 > best_result[2]:
-            best_result[2] = recall20
-            best_epoch[2] = epoch
-            stop = False
-            # ------select Mrr------------------
-        if ndgg5 > best_result[3]:
-            best_result[3] = ndgg5
-            best_epoch[3] = epoch
-            stop = False
-        if ndgg10 > best_result[4]:
-            best_result[4] = ndgg10
-            best_epoch[4] = epoch
-            stop = False
-        if ndgg20 > best_result[5]:
-            best_result[5] = ndgg20
-            best_epoch[5] = epoch
-            stop = False
+            losses.append(test_loss.item())
+            all_scores.append(all_score.detach().cpu().numpy())
+            neg_idxs.append(neg_idx.numpy())
+            if (iter + 1) % 50 == 0:
+                print('\tIter {}, test_loss {:.4f}'.format(iter + 1, np.mean(losses)), datetime.datetime.now())
+        results = eval_metric(all_scores, neg_idxs)
+        for metric_name, val in results.items():
+            if metric_name not in best or val > best[metric_name][0]:
+                stop = metric_name not in best   # stop=False when val exceeds best_result
+                best[metric_name] = (val, epoch)
         if stop:
             stop_num += 1
         else:
             stop_num = 0
-    print('\ttrain_loss:%.4f \
-            \n\ttest_loss:%.4f \
-            \n\tRecall@5:%.4f \
-            \n\tRecall@10:%.4f \
-            \n\tRecall@20:%.4f \
-            \n\tNDGG@5:%.4f \
-            \n\tNDGG@10:%.4f \
-            \n\tNDGG@20:%.4f \
-            \n\tEpoch:%d,%d,%d,%d,%d,%d' %
-            (epoch_loss, np.mean(all_loss), 
-            *tuple(best_result), *tuple(best_epoch)))
+    results_str = sum([f"\n\t{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best])
+    print(f"\ttrain_loss:{epoch_loss:.4f} \
+            \n\ttest_loss:{np.mean(losses):.4f}" + results_str)
     print('Epoch {}'.format(epoch), '=============================================')
     ###############################################################
 sys.stdout.close()
