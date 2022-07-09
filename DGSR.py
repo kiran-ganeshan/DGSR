@@ -4,44 +4,30 @@
 # @Author : ZM7
 # @File : DGSR
 # @Software: PyCharm
-import dgl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 
 
 class DGSR(nn.Module):
-    def __init__(self, user_num, item_num, input_dim, item_max_length, user_max_length, feat_drop=0.2, attn_drop=0.2,
-                 layer_num=3, time=True, use_last_item=False):
+    def __init__(self, user_num, item_num, input_dim, max_lookback, feat_drop=0.2, 
+                 attn_drop=0.2, layer_num=3, use_last_item=False):
         super(DGSR, self).__init__()
         self.user_num = user_num
         self.item_num = item_num
         self.hidden_size = input_dim
-        self.item_max_length = item_max_length
-        self.user_max_length = user_max_length
         self.layer_num = layer_num
-        self.time = time
         self.use_last_item = use_last_item
-
-        # # long- and short-term encoder
-        # self.user_long = user_long
-        # self.item_long = item_long
-        # self.user_short = user_short
-        # self.item_short = item_short
-        # # update function
-        # self.user_update = user_update
-        # self.item_update = item_update
 
         self.user_embedding = nn.Embedding(self.user_num, self.hidden_size)
         self.item_embedding = nn.Embedding(self.item_num, self.hidden_size)
-        self.unified_map = nn.Linear((self.layer_num + use_last_item) * self.hidden_size, self.hidden_size, bias=False)
-        self.layers = nn.ModuleList([DGSRLayers(self.hidden_size, self.user_max_length, self.item_max_length, 
-                                                feat_drop, attn_drop, use_short=use_last_item)
+        self.unified_map = nn.Linear((self.layer_num + use_last_item) * self.hidden_size, 
+                                     self.hidden_size, bias=False)
+        self.layers = nn.ModuleList([DGSRLayers(self.hidden_size, max_lookback, feat_drop, attn_drop, use_last_item)
                                      for _ in range(self.layer_num)])
         self.reset_parameters()
 
-    def forward(self, g, user_index=None, last_item_index=None, neg_tar=None, is_training=False):
+    def forward(self, g, user_index=None, last_item_index=None, all_label=None, is_training=False):
         feat_dict = None
         user_layer = []
         g.nodes['user'].data['user_h'] = self.user_embedding(g.nodes['user'].data['user_id'].cuda())
@@ -50,17 +36,15 @@ class DGSR(nn.Module):
             for conv in self.layers:
                 feat_dict = conv(g, feat_dict)
                 user_layer.append(graph_user(g, user_index, feat_dict['user']))
-                user_layer.append(feat_dict['user'][user_index])
             if self.use_last_item:
                 item_embed = graph_item(g, last_item_index, feat_dict['item'])
-                item_embed = feat_dict['item'][last_item_index]
                 user_layer.append(item_embed)
         unified_embedding = self.unified_map(torch.cat(user_layer, -1))
         score = torch.matmul(unified_embedding, self.item_embedding.weight.transpose(1, 0))
         if is_training:
             return score
         else:
-            neg_embedding = self.item_embedding(neg_tar)
+            neg_embedding = self.item_embedding(all_label)
             score_neg = torch.matmul(unified_embedding.unsqueeze(1), neg_embedding.transpose(2, 1)).squeeze(1)
             return score, score_neg
 
@@ -71,15 +55,11 @@ class DGSR(nn.Module):
                 nn.init.xavier_normal_(weight, gain=gain)
 
 
-
 class DGSRLayers(nn.Module):
-    def __init__(self, hidden_size, user_max_length, item_max_length, feat_drop=0.2, attn_drop=0.2, K=4, use_short=False):
+    def __init__(self, hidden_size, max_lookback, feat_drop=0.2, attn_drop=0.2, use_short=False):
         super(DGSRLayers, self).__init__()
         self.hidden_size = hidden_size
-        self.user_max_length = user_max_length
-        self.item_max_length = item_max_length
         self.use_short = use_short
-        self.K = torch.tensor(K).cuda()
         if use_short:
             self.agg_gate_u = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
             self.agg_gate_i = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
@@ -94,10 +74,10 @@ class DGSRLayers(nn.Module):
         self.last_weight_u = nn.Linear(hidden_size, hidden_size, bias=False)
         self.last_weight_i = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        self.i_time_encoding = nn.Embedding(user_max_length, hidden_size)
-        self.i_time_encoding_k = nn.Embedding(user_max_length, hidden_size)
-        self.u_time_encoding = nn.Embedding(item_max_length, hidden_size)
-        self.u_time_encoding_k = nn.Embedding(item_max_length, hidden_size)
+        self.i_time_encoding = nn.Embedding(max_lookback, hidden_size)
+        self.i_time_encoding_k = nn.Embedding(max_lookback, hidden_size)
+        self.u_time_encoding = nn.Embedding(max_lookback, hidden_size)
+        self.u_time_encoding_k = nn.Embedding(max_lookback, hidden_size)
 
     def user_update_function(self, user_now, user_old):
         return F.tanh(self.user_update(torch.cat([user_now, user_old], -1)))
@@ -105,7 +85,7 @@ class DGSRLayers(nn.Module):
     def item_update_function(self, item_now, item_old):
         return F.tanh(self.item_update(torch.cat([item_now, item_old], -1)))
 
-    def forward(self, g, feat_dict=None):
+    def forward(self, g, t, feat_dict=None):
         if feat_dict == None:
             user_ = g.nodes['user'].data['user_h']
             item_ = g.nodes['item'].data['item_h']
@@ -129,9 +109,10 @@ class DGSRLayers(nn.Module):
         return dic
 
     def item_reduce_func(self, nodes):
-        order = torch.argsort(torch.argsort(nodes.mailbox['time'], 1), 1)
-        re_order = nodes.mailbox['time'].shape[1] -order -1
-        length = nodes.mailbox['item_h'].shape[0]
+        order = nodes.mailbox['time']
+        re_order = order.max() - order
+        # order = torch.argsort(torch.argsort(nodes.mailbox['time'], 1), 1)
+        # re_order = nodes.mailbox['time'].shape[1] - order - 1
 
         e_ij = torch.sum((self.i_time_encoding(re_order) + nodes.mailbox['user_h']) * nodes.mailbox['item_h'], dim=2)\
                 /torch.sqrt(torch.tensor(self.hidden_size).float())
@@ -141,6 +122,7 @@ class DGSRLayers(nn.Module):
         h_long = torch.sum(alpha * (nodes.mailbox['user_h'] + self.i_time_encoding_k(re_order)), dim=1)
 
         if self.use_short:
+            length = nodes.mailbox['item_h'].shape[0]
             last = torch.argmax(nodes.mailbox['time'], 1)
             last_em = nodes.mailbox['user_h'][torch.arange(length), last, :].unsqueeze(1)
             e_ij1 = torch.sum(last_em * nodes.mailbox['user_h'], dim=2) / torch.sqrt(
@@ -163,9 +145,10 @@ class DGSRLayers(nn.Module):
         return dic
 
     def user_reduce_func(self, nodes):
-        order = torch.argsort(torch.argsort(nodes.mailbox['time'], 1),1)
-        re_order = nodes.mailbox['time'].shape[1] - order -1
-        length = nodes.mailbox['user_h'].shape[0]
+        order = nodes.mailbox['time']
+        re_order = order.max() - order
+        # order = torch.argsort(torch.argsort(nodes.mailbox['time'], 1),1)
+        # re_order = nodes.mailbox['time'].shape[1] - order - 1
 
         e_ij = torch.sum((self.u_time_encoding(re_order) + nodes.mailbox['item_h']) *nodes.mailbox['user_h'],
                             dim=2) / torch.sqrt(torch.tensor(self.hidden_size).float())
@@ -175,6 +158,7 @@ class DGSRLayers(nn.Module):
         h_long = torch.sum(alpha * (nodes.mailbox['item_h'] + self.u_time_encoding_k(re_order)), dim=1)
 
         if self.use_short:
+            length = nodes.mailbox['user_h'].shape[0]
             last = torch.argmax(nodes.mailbox['time'], 1)
             last_em = nodes.mailbox['item_h'][torch.arange(length), last, :].unsqueeze(1)
             e_ij1 = torch.sum(last_em * nodes.mailbox['item_h'], dim=2)/torch.sqrt(torch.tensor(self.hidden_size).float())
@@ -188,6 +172,7 @@ class DGSRLayers(nn.Module):
             user_h = h_long
         return {'user_h': user_h}
 
+
 def graph_user(bg, user_index, user_feats):
     b_user_size = bg.batch_num_nodes('user')
     tmp = torch.roll(torch.cumsum(b_user_size, 0), 1)
@@ -195,15 +180,10 @@ def graph_user(bg, user_index, user_feats):
     new_user_index = tmp + user_index
     return user_feats[new_user_index]
 
+
 def graph_item(bg, last_index, item_feats):
     b_item_size = bg.batch_num_nodes('item')
     tmp = torch.roll(torch.cumsum(b_item_size, 0), 1)
     tmp[0] = 0
     new_item_index = tmp + last_index
     return item_feats[new_item_index]
-
-def order_update(edges):
-    dic = {}
-    dic['order'] = torch.sort(edges.data['time'])[1]
-    dic['re_order'] = len(edges.data['time']) - dic['order']
-    return dic

@@ -20,7 +20,7 @@ import sys
 from torch.utils.data import DataLoader
 import torch.optim as optim
 import torch.nn as nn
-from utils import user_neg, eval_metric, mkdir_if_not_exist, collate, collate_test, get_multihot_label
+from utils import user_neg, eval_metric, mkdir_if_not_exist, get_collate, get_collate_test
 from preprocess import generate_graph, save_graphs, generate_data, preprocess_data
 
 
@@ -28,22 +28,23 @@ warnings.filterwarnings('ignore')
 parser = argparse.ArgumentParser()
 parser.add_argument('--data', default='Beauty', help='data name: sample')
 parser.add_argument('--load', type=str, default=None, help='past model to load (default: from scratch)')
-parser.add_argument('--batchSize', type=int, default=1024, help='input batch size')
-parser.add_argument('--hidden_size', type=int, default=50, help='hidden state size')
+parser.add_argument('--batch_size', type=int, default=256, help='input batch size')
+parser.add_argument('--hidden_size', type=int, default=100, help='hidden state size')
 parser.add_argument("--use_hinge", action='store_true', default=False, help='use multiclass hinge instead of cross entropy')
+parser.add_argument("--test_split", type=float, default=None, help='Fraction of times to go to test split')
+parser.add_argument("--test_num", type=int, default=None, help='Fraction of times to go to test split')
 parser.add_argument('--epoch', type=int, default=30, help='number of epochs to train for')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--l2', type=float, default=0.0001, help='l2 penalty')
-parser.add_argument('--feat_drop', type=float, default=0.3, help='drop_out')
-parser.add_argument('--attn_drop', type=float, default=0.3, help='drop_out')
+parser.add_argument('--feat_drop', type=float, default=0.0, help='drop_out')
+parser.add_argument('--attn_drop', type=float, default=0.0, help='drop_out')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
-parser.add_argument('--item_max_length', type=int, default=50, help='the max length of item sequence')
-parser.add_argument('--user_max_length', type=int, default=50, help='the max length of use sequence')
-parser.add_argument('--k_hop', type=int, default=2, help='sub-graph size')
+parser.add_argument('--max_lookback', type=int, default=50, help='maximum lookback in original time')
+parser.add_argument('--k_hop', type=int, default=-1, help='sub-graph size')
 parser.add_argument('--gpu', default='2')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--debug", action='store_true', default=False, help='debug mode (model not saved)')
-
+parser.add_argument("--run_id", type=str, default='', help='Additional identifier for run (outside of hparams)')
 
 opt = parser.parse_args()
 args, extras = parser.parse_known_args()
@@ -53,16 +54,17 @@ print(f"device: {device}")
 print(f"opt: {opt}")
 
 # loading data (and preprocessing if necessary)
-data_id = f"{opt.data}_{opt.item_max_length}_{opt.user_max_length}_{opt.k_hop}_{opt.use_hinge}"
-run_id = f"bs{opt.batchSize}_lr{opt.lr}_epoch{opt.epoch}"
+data_id = f"{opt.data}_{opt.test_split}_{opt.max_lookback}_{opt.k_hop}_{opt.use_hinge}"
+run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_ft{opt.feat_drop}_at{opt.attn_drop}"
+if opt.run_id:
+    run_id = opt.run_id + '_' + run_id
 data_path = 'static/' + data_id + '/'
 train_path = data_path + 'train/'
 test_path = data_path + 'test/'
-val_path = data_path + 'val/'
+val_path = data_path + 'val/' if opt.val else None
 graph_path = data_path + 'graph'
 metadata_path = data_path + 'meta'
 neg_path = data_path + 'neg'
-reverse_path = data_path + 'reverse'
 out_folder = 'results/' + data_id + '/'
 mkdir_if_not_exist(out_folder)
 out_file = out_folder + run_id + '.out'
@@ -71,18 +73,16 @@ sys.stdout = open(out_file, 'w+')
 def preprocess():
     print('start preprocessing:', datetime.datetime.now(), flush=True)
     for path in [data_path, train_path, test_path, val_path]:
-        mkdir_if_not_exist(path)
+        if path:
+            mkdir_if_not_exist(path)
     data = pd.read_csv('./data/' + opt.data + '.csv')
     
     # refine user, item, and time indices
     data, u_rev, i_rev = preprocess_data(data)
     
-    # mappings back to original user/item ids
-    with open(reverse_path, 'wb') as file:
-        pickle.dump({'u_rev': u_rev, 'i_rev': i_rev}, file)
-    
     # metadata
     metadata = {key + '_num': len(data[key + '_id'].unique()) for key in ['user', 'item']}
+    metadata = {**metadata, 'user_rev': u_rev, 'item_rev': i_rev}
     
     # negative samples
     data_neg = user_neg(data, metadata['item_num'])
@@ -97,16 +97,18 @@ def preprocess():
         graph = dgl.load_graphs(graph_path)[0][0]
         
     # data
-    train_num, test_num = generate_data(data, graph, metadata['item_num'], opt.item_max_length, opt.user_max_length, 
-                                        train_path, test_path, val_path, job=opt.epoch, k_hop=opt.k_hop, use_hinge=opt.use_hinge)
+    print('start data generation:', datetime.datetime.now(), flush=True)
+    train_num, val_num, test_num = generate_data(data, graph, metadata['item_num'], opt.max_lookback, 
+                                                 train_path, test_path, val_path, 30, opt.k_hop, opt.test_split, opt.test_num)
     
     # save metadata (last to indicate completion)
     with open(metadata_path, 'wb') as file:
         pickle.dump(metadata, file)
         
-    print('The number of train set:', train_num, flush=True)
-    print('The number of test set:', test_num, flush=True)
-    print('end preprocessing:', datetime.datetime.now(), flush=True)
+    print('The number of train set: ', train_num, flush=True)
+    print('The number of val set: ', val_num, flush=True)
+    print('The number of test set: ', test_num, flush=True)
+    print('End preprocessing: ', datetime.datetime.now(), flush=True)
 if not os.path.exists(metadata_path):
     preprocess()
 else:
@@ -115,29 +117,28 @@ with open(metadata_path, 'rb') as file:
     metadata = pickle.load(file)
     user_num = metadata['user_num']
     item_num = metadata['item_num']
-    
 
-
-train_set = StaticData(train_path, dgl.load_graphs)
-test_set = StaticData(test_path, dgl.load_graphs)
+train_set = StaticData(train_path)
+test_set = StaticData(test_path)
 if opt.val:
-    val_set = StaticData(val_path, dgl.load_graphs)
+    val_set = StaticData(val_path)
 
-print('train number:', train_set.size)
-print('test number:', test_set.size)
-print('user number:', user_num)
-print('item number:', item_num)
+print('train number: ', train_set.size)
+print('test number: ', test_set.size)
+print('user number: ', user_num)
+print('item number: ', item_num)
 with open(neg_path, 'rb') as f:
     data_neg = pickle.load(f) # negatives for evaluation
-train_data = DataLoader(dataset=train_set, batch_size=opt.batchSize, collate_fn=collate, shuffle=True, pin_memory=True, num_workers=12)
-test_data = DataLoader(dataset=test_set, batch_size=opt.batchSize, collate_fn=lambda x: collate_test(x, data_neg), pin_memory=True, num_workers=8)
+collate = get_collate(opt.use_hinge)
+collate_test = get_collate_test(opt.use_hinge, item_num, data_neg)
+train_data = DataLoader(dataset=train_set, batch_size=opt.batch_size, collate_fn=collate, shuffle=True, pin_memory=True, num_workers=12)
+test_data = DataLoader(dataset=test_set, batch_size=opt.batch_size, collate_fn=collate_test, pin_memory=True, num_workers=8)
 if opt.val:
-    val_data = DataLoader(dataset=val_set, batch_size=opt.batchSize, collate_fn=lambda x: collate_test(x, data_neg), pin_memory=True, num_workers=2)
+    val_data = DataLoader(dataset=val_set, batch_size=opt.batch_size, collate_fn=collate_test, pin_memory=True, num_workers=2)
 
 # initialize the model
-model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, item_max_length=opt.item_max_length,
-             user_max_length=opt.user_max_length, feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, 
-             layer_num=opt.layer_num).cuda()
+model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
+             feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
 if opt.load:
     state = torch.load(out_folder + 'model_' + opt.load)
     model.load_state_dict(state)
@@ -162,7 +163,6 @@ for epoch in range(opt.epoch):
     for user, batch_graph, label, last_item in train_data:
         iter += 1
         score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), is_training=True)
-        print(label.dtype, flush=True)
         loss = loss_func(score, label.cuda())
         optimizer.zero_grad()
         loss.backward()
@@ -179,30 +179,31 @@ for epoch in range(opt.epoch):
         print('start validation: ', datetime.datetime.now())
         val_losses, all_scores, neg_idxs = [], [], []
         with torch.no_grad:
-            for user, batch_graph, label, last_item, all, neg_idx in val_data:
-                score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), neg_tar=all.cuda(), is_training=False)
+            for user, batch_graph, label, last_item, all_label, neg_idx in val_data:
+                score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), all_label=all_label.cuda(), is_training=False)
                 val_loss = loss_func(score, label.cuda())
                 val_losses.append(val_loss.item())
                 all_scores.append(all_score.detach().cpu().numpy())
-                neg_idxs.append(neg_idx.numpy())
+                neg_idxs.append(neg_idx)
             results = eval_metric(all_scores, neg_idxs)
-            results_str = sum([f"\n\t{metric_name}: {val:.4f}" for metric_name, val in results])
+            results_str = '\n\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
             print(f"\ttrain_loss:{epoch_loss:.4f} \
-                   \n\tval_loss:{np.mean(val_losses):.4f}" + results_str)
+                   \n\tval_loss:{np.mean(val_losses):.4f} \
+                   \n\t{results_str}")
     ###############################################################
     
     ############################ test ############################
     print('start testing: ', datetime.datetime.now())
     losses, all_scores, neg_idxs = [], [], []
     iter = 0
-    for user, batch_graph, label, last_item, all, neg_idx in test_data:
+    for user, batch_graph, label, last_item, all_label, neg_idx in test_data:
         iter += 1
         with torch.no_grad():
-            score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), neg_tar=all.cuda(), is_training=False)
+            score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), all_label=all_label.cuda(), is_training=False)
             test_loss = loss_func(score, label.cuda())
             losses.append(test_loss.item())
             all_scores.append(all_score.detach().cpu().numpy())
-            neg_idxs.append(neg_idx.numpy())
+            neg_idxs.append(neg_idx)
             if (iter + 1) % 50 == 0:
                 print('\tIter {}, test_loss {:.4f}'.format(iter + 1, np.mean(losses)), datetime.datetime.now())
         results = eval_metric(all_scores, neg_idxs)
@@ -214,9 +215,10 @@ for epoch in range(opt.epoch):
             stop_num += 1
         else:
             stop_num = 0
-    results_str = sum([f"\n\t{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best])
+    results_str = '\n\t'.join([f"{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best.items()])
     print(f"\ttrain_loss:{epoch_loss:.4f} \
-            \n\ttest_loss:{np.mean(losses):.4f}" + results_str)
-    print('Epoch {}'.format(epoch), '=============================================')
+            \n\ttest_loss:{np.mean(losses):.4f} \
+            \n\t{results_str}")
+    print('Epoch {}'.format(epoch + 1), '=============================================')
     ###############################################################
 sys.stdout.close()
