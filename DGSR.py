@@ -11,23 +11,22 @@ import torch.nn.functional as F
 
 class DGSR(nn.Module):
     def __init__(self, user_num, item_num, input_dim, max_lookback, feat_drop=0.2, 
-                 attn_drop=0.2, layer_num=3, use_last_item=False):
+                 attn_drop=0.2, layer_num=3):
         super(DGSR, self).__init__()
         self.user_num = user_num
         self.item_num = item_num
         self.hidden_size = input_dim
         self.layer_num = layer_num
-        self.use_last_item = use_last_item
 
         self.user_embedding = nn.Embedding(self.user_num, self.hidden_size)
         self.item_embedding = nn.Embedding(self.item_num, self.hidden_size)
-        self.unified_map = nn.Linear((self.layer_num + use_last_item) * self.hidden_size, 
+        self.unified_map = nn.Linear(self.layer_num * self.hidden_size, 
                                      self.hidden_size, bias=False)
-        self.layers = nn.ModuleList([DGSRLayers(self.hidden_size, max_lookback, feat_drop, attn_drop, use_last_item)
+        self.layers = nn.ModuleList([DGSRLayers(self.hidden_size, max_lookback, feat_drop, attn_drop)
                                      for _ in range(self.layer_num)])
         self.reset_parameters()
 
-    def forward(self, g, user_index=None, last_item_index=None, all_label=None, is_training=False):
+    def forward(self, g, user, all_label=None, is_training=False):
         feat_dict = None
         user_layer = []
         g.nodes['user'].data['user_h'] = self.user_embedding(g.nodes['user'].data['user_id'].cuda())
@@ -35,18 +34,15 @@ class DGSR(nn.Module):
         if self.layer_num > 0:
             for conv in self.layers:
                 feat_dict = conv(g, feat_dict)
-                user_layer.append(graph_user(g, user_index, feat_dict['user']))
-            if self.use_last_item:
-                item_embed = graph_item(g, last_item_index, feat_dict['item'])
-                user_layer.append(item_embed)
+                user_layer.append(graph_user(g, user, feat_dict['user']))
         unified_embedding = self.unified_map(torch.cat(user_layer, -1))
         score = torch.matmul(unified_embedding, self.item_embedding.weight.transpose(1, 0))
+        score = torch.log_softmax(score, -1)
         if is_training:
             return score
-        else:
-            neg_embedding = self.item_embedding(all_label)
-            score_neg = torch.matmul(unified_embedding.unsqueeze(1), neg_embedding.transpose(2, 1)).squeeze(1)
-            return score, score_neg
+        neg_embedding = self.item_embedding(all_label)
+        score_neg = torch.matmul(unified_embedding.unsqueeze(-2), neg_embedding.transpose(-1, -2)).squeeze(-2)
+        return score, score_neg
 
     def reset_parameters(self):
         gain = nn.init.calculate_gain('relu')
@@ -56,13 +52,11 @@ class DGSR(nn.Module):
 
 
 class DGSRLayers(nn.Module):
-    def __init__(self, hidden_size, max_lookback, feat_drop=0.2, attn_drop=0.2, use_short=False):
+    def __init__(self, hidden_size, max_lookback, feat_drop=0.2, attn_drop=0.2):
         super(DGSRLayers, self).__init__()
         self.hidden_size = hidden_size
-        self.use_short = use_short
-        if use_short:
-            self.agg_gate_u = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
-            self.agg_gate_i = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
+        # self.agg_gate_u = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
+        # self.agg_gate_i = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
         self.feat_drop = nn.Dropout(feat_drop)
         self.atten_drop = nn.Dropout(attn_drop)
         self.user_weight = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -85,7 +79,7 @@ class DGSRLayers(nn.Module):
     def item_update_function(self, item_now, item_old):
         return F.tanh(self.item_update(torch.cat([item_now, item_old], -1)))
 
-    def forward(self, g, t, feat_dict=None):
+    def forward(self, g, feat_dict=None):
         if feat_dict == None:
             user_ = g.nodes['user'].data['user_h']
             item_ = g.nodes['item'].data['item_h']
@@ -121,20 +115,18 @@ class DGSRLayers(nn.Module):
             alpha = alpha.unsqueeze(2)
         h_long = torch.sum(alpha * (nodes.mailbox['user_h'] + self.i_time_encoding_k(re_order)), dim=1)
 
-        if self.use_short:
-            length = nodes.mailbox['item_h'].shape[0]
-            last = torch.argmax(nodes.mailbox['time'], 1)
-            last_em = nodes.mailbox['user_h'][torch.arange(length), last, :].unsqueeze(1)
-            e_ij1 = torch.sum(last_em * nodes.mailbox['user_h'], dim=2) / torch.sqrt(
-                torch.tensor(self.hidden_size).float())
-            alpha1 = self.atten_drop(F.softmax(e_ij1, dim=1))
-            if len(alpha1.shape) == 2:
-                alpha1 = alpha1.unsqueeze(2)
-            h_short = torch.sum(alpha1 * nodes.mailbox['user_h'], dim=1)
+        # length = nodes.mailbox['item_h'].shape[0]
+        # last = torch.argmax(nodes.mailbox['time'], 1)
+        # last_em = nodes.mailbox['user_h'][torch.arange(length), last, :].unsqueeze(1)
+        # e_ij1 = torch.sum(last_em * nodes.mailbox['user_h'], dim=2) / torch.sqrt(
+        #     torch.tensor(self.hidden_size).float())
+        # alpha1 = self.atten_drop(F.softmax(e_ij1, dim=1))
+        # if len(alpha1.shape) == 2:
+        #     alpha1 = alpha1.unsqueeze(2)
+        # h_short = torch.sum(alpha1 * nodes.mailbox['user_h'], dim=1)
 
-            item_h = self.agg_gate_i(torch.cat([h_long, h_short], -1))
-        else:
-            item_h = h_long
+        # item_h = self.agg_gate_i(torch.cat([h_long, h_short], -1))
+        item_h = h_long
         return {'item_h': item_h}
 
     def user_message_func(self, edges):
@@ -157,19 +149,17 @@ class DGSRLayers(nn.Module):
             alpha = alpha.unsqueeze(2)
         h_long = torch.sum(alpha * (nodes.mailbox['item_h'] + self.u_time_encoding_k(re_order)), dim=1)
 
-        if self.use_short:
-            length = nodes.mailbox['user_h'].shape[0]
-            last = torch.argmax(nodes.mailbox['time'], 1)
-            last_em = nodes.mailbox['item_h'][torch.arange(length), last, :].unsqueeze(1)
-            e_ij1 = torch.sum(last_em * nodes.mailbox['item_h'], dim=2)/torch.sqrt(torch.tensor(self.hidden_size).float())
-            alpha1 = self.atten_drop(F.softmax(e_ij1, dim=1))
-            if len(alpha1.shape) == 2:
-                alpha1 = alpha1.unsqueeze(2)
-            h_short = torch.sum(alpha1 * nodes.mailbox['item_h'], dim=1)
+        # length = nodes.mailbox['user_h'].shape[0]
+        # last = torch.argmax(nodes.mailbox['time'], 1)
+        # last_em = nodes.mailbox['item_h'][torch.arange(length), last, :].unsqueeze(1)
+        # e_ij1 = torch.sum(last_em * nodes.mailbox['item_h'], dim=2)/torch.sqrt(torch.tensor(self.hidden_size).float())
+        # alpha1 = self.atten_drop(F.softmax(e_ij1, dim=1))
+        # if len(alpha1.shape) == 2:
+        #     alpha1 = alpha1.unsqueeze(2)
+        # h_short = torch.sum(alpha1 * nodes.mailbox['item_h'], dim=1)
 
-            user_h = self.agg_gate_u(torch.cat([h_long, h_short], -1))
-        else:
-            user_h = h_long
+        # user_h = self.agg_gate_u(torch.cat([h_long, h_short], -1))
+        user_h = h_long
         return {'user_h': user_h}
 
 
@@ -177,13 +167,13 @@ def graph_user(bg, user_index, user_feats):
     b_user_size = bg.batch_num_nodes('user')
     tmp = torch.roll(torch.cumsum(b_user_size, 0), 1)
     tmp[0] = 0
-    new_user_index = tmp + user_index
+    new_user_index = tmp.unsqueeze(1) + user_index
     return user_feats[new_user_index]
 
 
-def graph_item(bg, last_index, item_feats):
-    b_item_size = bg.batch_num_nodes('item')
-    tmp = torch.roll(torch.cumsum(b_item_size, 0), 1)
-    tmp[0] = 0
-    new_item_index = tmp + last_index
-    return item_feats[new_item_index]
+# def graph_item(bg, last_index, item_feats):
+#     b_item_size = bg.batch_num_nodes('item')
+#     tmp = torch.roll(torch.cumsum(b_item_size, 0), 1)
+#     tmp[0] = 0
+#     new_item_index = tmp + last_index
+#     return item_feats[new_item_index]

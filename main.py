@@ -20,7 +20,7 @@ import sys
 from torch.utils.data import DataLoader
 import torch.optim as optim
 import torch.nn as nn
-from utils import user_neg, eval_metric, mkdir_if_not_exist, get_collate, get_collate_test
+from utils import user_neg, eval_metric, mkdir_if_not_exist, get_collate
 from preprocess import generate_graph, save_graphs, generate_data, preprocess_data
 
 
@@ -28,11 +28,12 @@ warnings.filterwarnings('ignore')
 parser = argparse.ArgumentParser()
 parser.add_argument('--data', default='Beauty', help='data name: sample')
 parser.add_argument('--load', type=str, default=None, help='past model to load (default: from scratch)')
-parser.add_argument('--batch_size', type=int, default=256, help='input batch size')
-parser.add_argument('--hidden_size', type=int, default=100, help='hidden state size')
-parser.add_argument("--use_hinge", action='store_true', default=False, help='use multiclass hinge instead of cross entropy')
-parser.add_argument("--test_split", type=float, default=None, help='Fraction of times to go to test split')
-parser.add_argument("--test_num", type=int, default=None, help='Fraction of times to go to test split')
+parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
+parser.add_argument('--hidden_size', type=int, default=25, help='hidden state size')
+parser.add_argument("--test_num", type=int, default=4, help='Number of test times')
+parser.add_argument("--n_user", type=int, default=30000, help='Number of users per graph (if bucketing)')
+parser.add_argument("--bucket", action='store_true', default=False, help='Whether to bucket users')
+parser.add_argument("--k_hop", type=int, default=-1, help='Number of hops in preprocessing')
 parser.add_argument('--epoch', type=int, default=30, help='number of epochs to train for')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--l2', type=float, default=0.0001, help='l2 penalty')
@@ -40,8 +41,7 @@ parser.add_argument('--feat_drop', type=float, default=0.0, help='drop_out')
 parser.add_argument('--attn_drop', type=float, default=0.0, help='drop_out')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
 parser.add_argument('--max_lookback', type=int, default=50, help='maximum lookback in original time')
-parser.add_argument('--k_hop', type=int, default=-1, help='sub-graph size')
-parser.add_argument('--gpu', default='2')
+parser.add_argument('--gpu', default='3')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--debug", action='store_true', default=False, help='debug mode (model not saved)')
 parser.add_argument("--run_id", type=str, default='', help='Additional identifier for run (outside of hparams)')
@@ -54,8 +54,10 @@ print(f"device: {device}")
 print(f"opt: {opt}")
 
 # loading data (and preprocessing if necessary)
-data_id = f"{opt.data}_{opt.test_split}_{opt.max_lookback}_{opt.k_hop}_{opt.use_hinge}"
-run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_ft{opt.feat_drop}_at{opt.attn_drop}"
+data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.bucket}"
+if not opt.bucket:
+    data_id += f"_{opt.k_hop}"
+run_id = f"bs{opt.batch_size}_nu{opt.n_user}_lr{opt.lr}_ep{opt.epoch}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}"
 if opt.run_id:
     run_id = opt.run_id + '_' + run_id
 data_path = 'static/' + data_id + '/'
@@ -99,7 +101,7 @@ def preprocess():
     # data
     print('start data generation:', datetime.datetime.now(), flush=True)
     train_num, val_num, test_num = generate_data(data, graph, metadata['item_num'], opt.max_lookback, 
-                                                 train_path, test_path, val_path, 30, opt.k_hop, opt.test_split, opt.test_num)
+                                                 train_path, test_path, val_path, opt.test_num, opt.bucket, opt.k_hop)
     
     # save metadata (last to indicate completion)
     with open(metadata_path, 'wb') as file:
@@ -129,8 +131,8 @@ print('user number: ', user_num)
 print('item number: ', item_num)
 with open(neg_path, 'rb') as f:
     data_neg = pickle.load(f) # negatives for evaluation
-collate = get_collate(opt.use_hinge)
-collate_test = get_collate_test(opt.use_hinge, item_num, data_neg)
+collate = get_collate(item_num, opt.n_user, device)
+collate_test = get_collate(item_num, opt.n_user, device, data_neg)
 train_data = DataLoader(dataset=train_set, batch_size=opt.batch_size, collate_fn=collate, shuffle=True, pin_memory=True, num_workers=12)
 test_data = DataLoader(dataset=test_set, batch_size=opt.batch_size, collate_fn=collate_test, pin_memory=True, num_workers=8)
 if opt.val:
@@ -143,10 +145,11 @@ if opt.load:
     state = torch.load(out_folder + 'model_' + opt.load)
     model.load_state_dict(state)
 optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.l2)
-loss_func = nn.MultiLabelMarginLoss() if opt.use_hinge else nn.BCEWithLogitsLoss()
+loss_func = nn.BCEWithLogitsLoss(reduction='mean')
 best = {}
 stop_num = 0
 epoch_start = None
+
 for epoch in range(opt.epoch):
     stop = True
     epoch_loss = 0
@@ -160,15 +163,18 @@ for epoch in range(opt.epoch):
     print('start training: ', curr_time)
     epoch_start = curr_time
     model.train()
-    for user, batch_graph, label, last_item in train_data:
+    for batch_graph, user, target in train_data:
         iter += 1
-        score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), is_training=True)
-        loss = loss_func(score, label.cuda())
+        batch_graph = batch_graph.to(device)
+        user = user.cuda()
+        target = target.cuda()
+        score = model(batch_graph.to(device), user.cuda(), is_training=True)
+        loss = loss_func(score, target.cuda())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
-        if iter % 400 == 0:
+        if iter % (4 if opt.bucket else 400) == 0:
             print('Iter {}, loss {:.4f}'.format(iter, epoch_loss/iter), datetime.datetime.now())
     epoch_loss /= iter
     ###############################################################
@@ -179,12 +185,17 @@ for epoch in range(opt.epoch):
         print('start validation: ', datetime.datetime.now())
         val_losses, all_scores, neg_idxs = [], [], []
         with torch.no_grad:
-            for user, batch_graph, label, last_item, all_label, neg_idx in val_data:
-                score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), all_label=all_label.cuda(), is_training=False)
-                val_loss = loss_func(score, label.cuda())
+            for batch_graph, user, target, all_label, num_pos in val_data:
+                batch_graph = batch_graph.to(device)
+                user = user.cuda()
+                target = target.cuda()
+                all_label = all_label.cuda()
+                score, all_score = model(batch_graph, user, all_label=all_label, is_training=False)
+                val_loss = loss_func(score, target)
                 val_losses.append(val_loss.item())
-                all_scores.append(all_score.detach().cpu().numpy())
-                neg_idxs.append(neg_idx)
+                all_scores.append(all_score)
+                neg_idxs.append(num_pos)
+            all_scores = [score.detach().cpu().numpy() for score in all_scores]
             results = eval_metric(all_scores, neg_idxs)
             results_str = '\n\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
             print(f"\ttrain_loss:{epoch_loss:.4f} \
@@ -196,29 +207,36 @@ for epoch in range(opt.epoch):
     print('start testing: ', datetime.datetime.now())
     losses, all_scores, neg_idxs = [], [], []
     iter = 0
-    for user, batch_graph, label, last_item, all_label, neg_idx in test_data:
+    for batch_graph, user, target, all_label, num_pos in test_data:
         iter += 1
         with torch.no_grad():
-            score, all_score = model(batch_graph.to(device), user.cuda(), last_item.cuda(), all_label=all_label.cuda(), is_training=False)
-            test_loss = loss_func(score, label.cuda())
+            batch_graph = batch_graph.to(device)
+            user = user.cuda()
+            target = target.cuda()
+            all_label = all_label.cuda()
+            score, all_score = model(batch_graph, user, all_label=all_label, is_training=False)
+            test_loss = loss_func(score, target)
             losses.append(test_loss.item())
-            all_scores.append(all_score.detach().cpu().numpy())
-            neg_idxs.append(neg_idx)
-            if (iter + 1) % 50 == 0:
+            all_scores.append(all_score)
+            neg_idxs.append(num_pos)
+            if opt.bucket or (iter + 1) % 50 == 0:
                 print('\tIter {}, test_loss {:.4f}'.format(iter + 1, np.mean(losses)), datetime.datetime.now())
-        results = eval_metric(all_scores, neg_idxs)
-        for metric_name, val in results.items():
-            if metric_name not in best or val > best[metric_name][0]:
-                stop = metric_name not in best   # stop=False when val exceeds best_result
-                best[metric_name] = (val, epoch)
-        if stop:
-            stop_num += 1
-        else:
-            stop_num = 0
-    results_str = '\n\t'.join([f"{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best.items()])
+    all_scores = [scores.detach().cpu().numpy() for scores in all_scores]
+    results = eval_metric(all_scores, neg_idxs)
+    for metric_name, val in results.items():
+        if metric_name not in best or val > best[metric_name][0]:
+            stop = metric_name not in best   # stop=False when val exceeds best_result
+            best[metric_name] = (val, epoch)
+    if stop:
+        stop_num += 1
+    else:
+        stop_num = 0
+    results_str = '\n\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
     print(f"\ttrain_loss:{epoch_loss:.4f} \
             \n\ttest_loss:{np.mean(losses):.4f} \
             \n\t{results_str}")
     print('Epoch {}'.format(epoch + 1), '=============================================')
     ###############################################################
+results_str = '\n\t'.join([f"{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best.items()])
+print(f"\t{results_str}")
 sys.stdout.close()

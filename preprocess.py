@@ -8,6 +8,7 @@
 from xml.dom.minicompat import NodeList
 import dgl
 import numpy as np
+import pandas as pd
 import torch
 from dgl import save_graphs
 from joblib import Parallel, delayed
@@ -40,10 +41,53 @@ def generate_graph(data):
     graph.nodes['item'].data['item_id'] = torch.tensor(np.unique(item)).long()
     return graph
 
+def generate(data, graph, item_num, max_lookback, t_cutoff,
+             train_path, test_path, val_path):
+    train_num, test_num, val_num = 0, 0, 0
+    data = data.rename(columns={'user_id': 'users', 'item_id': 'items'})
+    data = data.groupby(['time', 'users'])
+    data = pd.DataFrame({'items': data['items'].apply(lambda x: list(x))})
+    data['num_items'] = data['items'].apply(lambda x: len(x))
+
+    data['items'] = data.apply(lambda r: [r['items'] + (item_num - r['num_items']) * [-1]], axis=1)
+    data['items'] = data['items'].apply(lambda lst: lst[0])
+    data = data.reset_index().groupby('time')
+    keys = ['users', 'items', 'num_items']
+    data = data.apply(lambda r: pd.Series([list(r[k]) for k in keys], index=keys))
+    data['num_users'] = data['users'].apply(lambda x: len(x))
+    max_users = data['num_users'].max()
+    def pad(data, key, padding=-1):
+        data[key] = data.apply(lambda r: [r[key] + (max_users - r['num_users']) * [padding]], axis=1)
+        data[key] = data[key].apply(lambda lst: lst[0])
+        return data
+    data = pad(data, 'users')
+    data = pad(data, 'items', padding=item_num * [-1])
+    data = pad(data, 'num_items')
+    for t, row in data.iterrows():
+        edges = {key: (graph.edges[key].data['time'] < t) & 
+                      (graph.edges[key].data['time'] >= t - max_lookback) 
+                      for key in graph.etypes}
+        subgraph = dgl.edge_subgraph(graph, edges, relabel_nodes=False)
+        rel_path = '/' + str(t) + '.bin'
+        keys = ['items', 'users', 'num_items', 'num_users']
+        labels = {key: torch.tensor([row[key]]).long() for key in keys}
+        labels = {**labels, 'time': torch.tensor([t]).long()}
+        if t == t_cutoff and val_path is not None:
+            dgl.save_graphs(val_path + rel_path, subgraph, labels)
+            val_num += 1
+        elif t <= t_cutoff:
+            dgl.save_graphs(train_path + rel_path, subgraph, labels)
+            train_num += 1
+        else:
+            dgl.save_graphs(test_path + rel_path, subgraph, labels)
+            test_num += 1
+    return train_num, val_num, test_num
+    
+
 
 def generate_user(user, data, graph, item_num, max_lookback, t_cutoff, 
                   train_path, test_path, val_path, k_hop):
-    data = data.sort_values('time')
+    data = data[data['user_id'] == user].sort_values('time')
     u_time = data['time'].values
     u_seq = data['item_id'].values
     
@@ -60,11 +104,7 @@ def generate_user(user, data, graph, item_num, max_lookback, t_cutoff,
     train_num, val_num, test_num = 0, 0, 0
     if len(u_seq) < 2:                      # if not enough data for a training 
         return train_num, val_num, test_num # example, ignore this user
-    for j, t in enumerate(basket_time[1:]):
-        # set target and most last basket
-        target = u_basket_seq[j + 1]
-        last_basket = u_basket_seq[j]
-        
+    for t, target in zip(basket_time[1:], u_basket_seq[1:]):
         # remove future edges and past edges older than max_lookback
         edges = {key: (graph.edges[key].data['time'] < t) & 
                       (graph.edges[key].data['time'] >= t - max_lookback) 
@@ -95,14 +135,15 @@ def generate_user(user, data, graph, item_num, max_lookback, t_cutoff,
         subgraph = dgl.edge_subgraph(subgraph, edges, relabel_nodes=False)
         
         # prune & pad target and last basket
-        last_basket = [item for item in nodes['item'] if item in last_basket]
-        last_basket += [-1] * (item_num - len(last_basket))
-        target += [-1] * (item_num - len(target))
+        num_targets = len(target)
+        pad_target = target + [-1] * (item_num - num_targets)
+        assert len(pad_target) == item_num
         
         # save graphs
-        rel_path = '/' + str(user) + '/' + str(t) + '.bin'
-        labels = {'target': target, 'user': user, 'last': last_basket, 'time': t}
+        rel_path = '/' + str(user) + '_' + str(t) + '.bin'
+        labels = {'items': [pad_target], 'users': [user], 'num_items': [num_targets], 'num_users': 1}
         labels = {key: torch.tensor([val]).long() for key, val in labels.items()}
+        labels = {**labels, 'time': torch.tensor([t]).long()}
         if t == t_cutoff and val_path is not None:
             save_graphs(val_path + rel_path, subgraph, labels)
             val_num += 1
@@ -115,17 +156,16 @@ def generate_user(user, data, graph, item_num, max_lookback, t_cutoff,
     return train_num, val_num, test_num
 
 
-def generate_data(data, graph, item_num, max_lookback, train_path, test_path, val_path, 
-                  job, k_hop, test_split=None, test_num=None):
-    user = data['user_id'].unique()
-    assert test_split or test_num
+def generate_data(data, graph, item_num, max_lookback, train_path, test_path, val_path, test_num, bucket, k_hop):
     times = np.sort(np.unique(data['time'].values))
-    test_split = None if test_split is None else max(int(test_split * len(times)), 1)
-    n_test_t = test_split or test_num
-    t_cutoff = times[-n_test_t - 1]
+    users = np.sort(np.unique(data['user_id'].values))
+    t_cutoff = times[-test_num - 1]
+    if bucket:
+        return generate(data, graph, item_num, max_lookback, 
+                        t_cutoff, train_path, test_path, val_path)
     generate_func = lambda u: generate_user(u, data, graph, item_num, max_lookback, t_cutoff, 
                                             train_path, test_path, val_path, k_hop)
-    a = Parallel(n_jobs=job)(delayed(generate_func)(u) for u in user)
+    a = Parallel(n_jobs=30)(delayed(generate_func)(u) for u in users)
     return tuple([sum(tup) for tup in zip(*a)])
     
 
