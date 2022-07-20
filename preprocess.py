@@ -85,7 +85,7 @@ def generate(data, graph, item_num, max_lookback, t_cutoff,
     
 
 
-def generate_user(user, data, graph, item_num, max_lookback, t_cutoff, 
+def generate_user(user, data, graph, max_lookback, t_cutoff, 
                   train_path, test_path, val_path, k_hop):
     data = data[data['user_id'] == user].sort_values('time')
     u_time = data['time'].values
@@ -134,14 +134,9 @@ def generate_user(user, data, graph, item_num, max_lookback, t_cutoff,
                     edges[etype].append(eid)
         subgraph = dgl.edge_subgraph(subgraph, edges, relabel_nodes=False)
         
-        # prune & pad target and last basket
-        num_targets = len(target)
-        pad_target = target + [-1] * (item_num - num_targets)
-        assert len(pad_target) == item_num
-        
         # save graphs
         rel_path = '/' + str(user) + '_' + str(t) + '.bin'
-        labels = {'items': [pad_target], 'users': [user], 'num_items': [num_targets], 'num_users': 1}
+        labels = {'items': [target], 'users': [user], 'num_items': [len(target)], 'num_users': 1}
         labels = {key: torch.tensor([val]).long() for key, val in labels.items()}
         labels = {**labels, 'time': torch.tensor([t]).long()}
         if t == t_cutoff and val_path is not None:
@@ -163,9 +158,9 @@ def generate_data(data, graph, item_num, max_lookback, train_path, test_path, va
     if bucket:
         return generate(data, graph, item_num, max_lookback, 
                         t_cutoff, train_path, test_path, val_path)
-    generate_func = lambda u: generate_user(u, data, graph, item_num, max_lookback, t_cutoff, 
+    generate_func = lambda u: generate_user(u, data, graph, max_lookback, t_cutoff, 
                                             train_path, test_path, val_path, k_hop)
-    a = Parallel(n_jobs=30)(delayed(generate_func)(u) for u in users)
+    a = Parallel(n_jobs=10)(delayed(generate_func)(u) for u in users)
     return tuple([sum(tup) for tup in zip(*a)])
     
 

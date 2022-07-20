@@ -29,9 +29,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data', default='Beauty', help='data name: sample')
 parser.add_argument('--load', type=str, default=None, help='past model to load (default: from scratch)')
 parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
-parser.add_argument('--hidden_size', type=int, default=25, help='hidden state size')
+parser.add_argument('--hidden_size', type=int, default=15, help='hidden state size')
 parser.add_argument("--test_num", type=int, default=4, help='Number of test times')
-parser.add_argument("--n_user", type=int, default=30000, help='Number of users per graph (if bucketing)')
+parser.add_argument("--n_user", type=int, default=29000, help='Number of users per graph (if bucketing)')
 parser.add_argument("--bucket", action='store_true', default=False, help='Whether to bucket users')
 parser.add_argument("--k_hop", type=int, default=-1, help='Number of hops in preprocessing')
 parser.add_argument('--epoch', type=int, default=30, help='number of epochs to train for')
@@ -39,8 +39,9 @@ parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--l2', type=float, default=0.0001, help='l2 penalty')
 parser.add_argument('--feat_drop', type=float, default=0.0, help='drop_out')
 parser.add_argument('--attn_drop', type=float, default=0.0, help='drop_out')
+parser.add_argument('--mean', action='store_true', default=False, help='Train to mean')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
-parser.add_argument('--max_lookback', type=int, default=50, help='maximum lookback in original time')
+parser.add_argument('--max_lookback', type=int, default=25, help='maximum lookback in original time')
 parser.add_argument('--gpu', default='3')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--debug", action='store_true', default=False, help='debug mode (model not saved)')
@@ -57,7 +58,7 @@ print(f"opt: {opt}")
 data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.bucket}"
 if not opt.bucket:
     data_id += f"_{opt.k_hop}"
-run_id = f"bs{opt.batch_size}_nu{opt.n_user}_lr{opt.lr}_ep{opt.epoch}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}"
+run_id = f"bs{opt.batch_size}_nu{opt.n_user}_lr{opt.lr}_ep{opt.epoch}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}_tm{opt.mean}"
 if opt.run_id:
     run_id = opt.run_id + '_' + run_id
 data_path = 'static/' + data_id + '/'
@@ -70,7 +71,7 @@ neg_path = data_path + 'neg'
 out_folder = 'results/' + data_id + '/'
 mkdir_if_not_exist(out_folder)
 out_file = out_folder + run_id + '.out'
-model_file = out_folder + 'model_' + run_id
+model_file = data_path + 'model_' + run_id
 sys.stdout = open(out_file, 'w+')
 def preprocess():
     print('start preprocessing:', datetime.datetime.now(), flush=True)
@@ -131,8 +132,8 @@ print('user number: ', user_num)
 print('item number: ', item_num)
 with open(neg_path, 'rb') as f:
     data_neg = pickle.load(f) # negatives for evaluation
-collate = get_collate(item_num, opt.n_user, device)
-collate_test = get_collate(item_num, opt.n_user, device, data_neg)
+collate = get_collate(item_num, opt.n_user, device, opt.mean)
+collate_test = get_collate(item_num, opt.n_user, device, opt.mean, data_neg)
 train_data = DataLoader(dataset=train_set, batch_size=opt.batch_size, collate_fn=collate, shuffle=True, pin_memory=True, num_workers=12)
 test_data = DataLoader(dataset=test_set, batch_size=opt.batch_size, collate_fn=collate_test, pin_memory=True, num_workers=8)
 if opt.val:
@@ -142,10 +143,10 @@ if opt.val:
 model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
 if opt.load:
-    state = torch.load(out_folder + 'model_' + opt.load)
+    state = torch.load(data_path + 'model_' + opt.load)
     model.load_state_dict(state)
 optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.l2)
-loss_func = nn.BCEWithLogitsLoss(reduction='mean')
+loss_func = nn.BCEWithLogitsLoss(reduction='mean').to(device)
 best = {}
 stop_num = 0
 epoch_start = None
@@ -153,6 +154,8 @@ epoch_start = None
 for epoch in range(opt.epoch):
     stop = True
     epoch_loss = 0
+    val_loss = 0
+    test_loss = 0
     iter = 0
     
     ############################ train ############################
@@ -168,73 +171,92 @@ for epoch in range(opt.epoch):
         batch_graph = batch_graph.to(device)
         user = user.cuda()
         target = target.cuda()
-        score = model(batch_graph.to(device), user.cuda(), is_training=True)
-        loss = loss_func(score, target.cuda())
+        score = model(batch_graph, user, is_training=True)
+        loss = loss_func(score, target)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        epoch_loss += loss.item()
+        epoch_loss += loss.detach().cpu().item()
+        if opt.bucket:
+            del user, target
+            torch.cuda.empty_cache()
         if iter % (4 if opt.bucket else 400) == 0:
-            print('Iter {}, loss {:.4f}'.format(iter, epoch_loss/iter), datetime.datetime.now())
+            print('\tIter {}, loss {:.4f}'.format(iter, epoch_loss/iter), datetime.datetime.now(), flush=True)
     epoch_loss /= iter
     ###############################################################
 
     ############################ val ##############################
     model.eval()
+    iter = 0
     if opt.val:
         print('start validation: ', datetime.datetime.now())
-        val_losses, all_scores, neg_idxs = [], [], []
+        ranks, neg_idxs = [], []
         with torch.no_grad:
             for batch_graph, user, target, all_label, num_pos in val_data:
+                iter += 1
                 batch_graph = batch_graph.to(device)
                 user = user.cuda()
                 target = target.cuda()
                 all_label = all_label.cuda()
+                num_pos = num_pos.cuda()
                 score, all_score = model(batch_graph, user, all_label=all_label, is_training=False)
-                val_loss = loss_func(score, target)
-                val_losses.append(val_loss.item())
-                all_scores.append(all_score)
+                loss = loss_func(score, target)
+                val_loss += loss.cpu().item()
+                rank = all_score.argsort(-1).argsort(-1)
+                ranks.append(rank)
                 neg_idxs.append(num_pos)
-            all_scores = [score.detach().cpu().numpy() for score in all_scores]
-            results = eval_metric(all_scores, neg_idxs)
-            results_str = '\n\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
-            print(f"\ttrain_loss:{epoch_loss:.4f} \
-                   \n\tval_loss:{np.mean(val_losses):.4f} \
-                   \n\t{results_str}")
+                if opt.bucket:
+                    del user, target, all_label
+                    torch.cuda.empty_cache()
+            ranks = [rank.detach().cpu().numpy() for rank in ranks]
+            results = eval_metric(ranks, neg_idxs)
+            results_str = '\n'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
+            print(f"train_loss:{epoch_loss:.4f} \
+                   \nval_loss:{(val_loss / iter):.4f} \
+                   \n{results_str}", flush=True)
     ###############################################################
     
     ############################ test ############################
     print('start testing: ', datetime.datetime.now())
-    losses, all_scores, neg_idxs = [], [], []
+    ranks, neg_idxs = [], []
     iter = 0
-    for batch_graph, user, target, all_label, num_pos in test_data:
-        iter += 1
-        with torch.no_grad():
+    with torch.no_grad():
+        for batch_graph, user, target, all_label, num_pos in test_data:
+            iter += 1
             batch_graph = batch_graph.to(device)
             user = user.cuda()
             target = target.cuda()
             all_label = all_label.cuda()
+            num_pos = num_pos.cuda()
             score, all_score = model(batch_graph, user, all_label=all_label, is_training=False)
-            test_loss = loss_func(score, target)
-            losses.append(test_loss.item())
-            all_scores.append(all_score)
+            loss = loss_func(score, target)
+            test_loss += loss.cpu().item()
+            rank = all_score.argsort(-1).argsort(-1)
+            ranks.append(rank)
             neg_idxs.append(num_pos)
+            if opt.bucket:
+                del user, target, all_label
+                torch.cuda.empty_cache()
             if opt.bucket or (iter + 1) % 50 == 0:
-                print('\tIter {}, test_loss {:.4f}'.format(iter + 1, np.mean(losses)), datetime.datetime.now())
-    all_scores = [scores.detach().cpu().numpy() for scores in all_scores]
-    results = eval_metric(all_scores, neg_idxs)
+                print('\tIter {}, test_loss {:.4f}'.format(iter, test_loss / iter), datetime.datetime.now(), flush=True)
+        ranks = torch.cat(ranks, 0)
+        neg_idxs = torch.cat(neg_idxs, 0)
+        results = eval_metric(ranks, neg_idxs, device)
     for metric_name, val in results.items():
         if metric_name not in best or val > best[metric_name][0]:
             stop = metric_name not in best   # stop=False when val exceeds best_result
             best[metric_name] = (val, epoch)
+        if epoch == best[metric_name][1] and not opt.debug:
+            file_add = '' if metric_name == 'recall@10' else f'_{metric_name}'
+            torch.save(model.state_dict(), model_file + file_add)
     if stop:
         stop_num += 1
     else:
         stop_num = 0
-    results_str = '\n\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
-    print(f"\ttrain_loss:{epoch_loss:.4f} \
-            \n\ttest_loss:{np.mean(losses):.4f} \
-            \n\t{results_str}")
+    results_str = '\n'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
+    print(f"train_loss:{epoch_loss:.4f} \
+            \ntest_loss:{test_loss / iter:.4f} \
+            \n{results_str}", flush=True)
     print('Epoch {}'.format(epoch + 1), '=============================================')
     ###############################################################
 results_str = '\n\t'.join([f"{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best.items()])

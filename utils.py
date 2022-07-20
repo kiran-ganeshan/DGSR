@@ -49,7 +49,8 @@ def neg_generate(user, label, data_neg, neg_num=100):
             if has_idx[i, j]:                          # replace any -1s in label with neg samples
                 idx = first_idx[i, j].item()
                 label[i, j, idx:] = np.random.choice(neg_choices, label.shape[-1] - idx)
-    all_label = torch.tensor(np.concatenate([label, neg], axis=-1)).long()
+    all_label = torch.tensor(np.concatenate([label, neg], axis=-1)).long() 
+    first_idx = torch.tensor(first_idx)
     return all_label, first_idx
 
 def sample_users(user, label, target, num_user, num_target, n_user):
@@ -79,15 +80,17 @@ def sample_users(user, label, target, num_user, num_target, n_user):
     label = torch.cat([label, extra_label], 1)
     return user, label, target, num_target
 
-def multihot(label, num_user, num_target, item_num):
+def multihot(label, num_user, num_target, item_num, mean):
     T, U, _ = label.shape
     target = -torch.ones((T, U, item_num), dtype=torch.float)
     for t, nu in enumerate(num_user):
         for u in range(nu):
-            target[t, u, :] = one_hot(label[t, u, :num_target[t, u]].long(), num_classes=item_num).sum(-2).float()
+            l = label[t, u, :num_target[t, u]].long()
+            l = one_hot(l, num_classes=item_num).float()
+            target[t, u, :] = l.mean(-2) if mean else l.sum(-2)
     return target
 
-def get_collate(item_num, n_user, device, data_neg=None):
+def get_collate(item_num, n_user, device, mean, data_neg=None):
     def collate(data):
         # gather data
         user, num_user, graph, label, num_target = [], [], [], [], []
@@ -95,7 +98,7 @@ def get_collate(item_num, n_user, device, data_neg=None):
             user.append(labels['users'])
             num_user.append(labels['num_users'])
             graph.extend(graphs)
-            label.append(labels['items'])
+            label.append(torch.cat([labels['items'], -torch.ones(item_num - len(labels['items']))]))
             num_target.append(labels['num_items'])
         # batch and move to torch
         user = torch.cat(user).long()
@@ -104,7 +107,7 @@ def get_collate(item_num, n_user, device, data_neg=None):
         num_target = torch.cat(num_target).long()
         num_user = torch.tensor(num_user).long()
         # multihot-encode target and sample remaining users
-        target = multihot(label, num_user, num_target, item_num)
+        target = multihot(label, num_user, num_target, item_num, mean)
         user, label, target, num_target = sample_users(user, label, target, num_user, num_target, n_user)
         # generate negatives if required
         tup = () if data_neg is None else neg_generate(user, label, data_neg)
@@ -115,26 +118,20 @@ def get_collate(item_num, n_user, device, data_neg=None):
         return graph, user, target, *tup
     return collate
 
-def eval_metric(all_scores, neg_idxs, ats=[5, 10, 20]):
+def eval_metric(ranks, neg_idxs, device, ats=[5, 10, 20]):
     recalls = {at: [] for at in ats}
     ndcgs = {at: ([], []) for at in ats}
-    all_scores = np.concatenate(all_scores)
-    all_scores = all_scores.reshape((-1, all_scores.shape[-1]))
-    neg_idxs = np.concatenate(neg_idxs).reshape(-1)
-    prediction = (-all_scores).argsort(-1).argsort(-1)
-    for ranks, idx in zip(prediction, neg_idxs):
-        for i, rank in enumerate(ranks[:idx]):
-            for at in ats:
-                if rank < at:
-                    ndcgs[at][0].append(1 / np.log2(rank + 2))
-                    recalls[at].append(1)
-                else:
-                    ndcgs[at][0].append(0)
-                    recalls[at].append(0)
-                if i < at:
-                    ndcgs[at][1].append(1 / np.log2(i + 2))
-    recalls = {f'recall@{at}': np.mean(lst) for at, lst in recalls.items()}
-    ndcgs = {f'ndcg@{at}': np.sum(num) / np.sum(denom) for (at, (num, denom)) in ndcgs.items()}
+    ranks = ranks.reshape((-1, ranks.shape[-1]))
+    neg_idxs = neg_idxs.reshape(-1) 
+    idxs = torch.arange(0, ranks.shape[-1], device=device).unsqueeze(0)
+    zero = torch.tensor(0., device=device)
+    mask = idxs < neg_idxs.unsqueeze(1)
+    cum_gain = lambda mask, ranks: torch.where(mask, 1 / torch.log2(ranks + 2), zero).sum(-1)
+    for at in ats:
+        recalls[at] = ((ranks < at) * mask).float().sum(-1) / mask.float().sum(-1)
+        ndcgs[at] = cum_gain((ranks < at) * mask, ranks) / cum_gain(mask, idxs)
+    recalls = {f'recall@{at}': val.mean(0).cpu().numpy().item() for at, val in recalls.items()}
+    ndcgs = {f'ndcg@{at}': val.mean(0).cpu().numpy().item() for at, val in ndcgs.items()}
     return {**recalls, **ndcgs}
 
 def mkdir_if_not_exist(file_name):
