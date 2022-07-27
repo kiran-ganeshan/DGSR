@@ -42,7 +42,7 @@ parser.add_argument('--attn_drop', type=float, default=0.0, help='drop_out')
 parser.add_argument('--mean', action='store_true', default=False, help='Train to mean')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
 parser.add_argument('--max_lookback', type=int, default=25, help='maximum lookback in original time')
-parser.add_argument('--gpu', default='1')
+parser.add_argument('--gpu', default='0')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--debug", action='store_true', default=False, help='debug mode (model not saved)')
 parser.add_argument("--run_id", type=str, default='', help='Additional identifier for run (outside of hparams)')
@@ -141,7 +141,9 @@ if opt.val:
     val_data = DataLoader(dataset=val_set, batch_size=opt.batch_size, collate_fn=collate_test, pin_memory=True, num_workers=2)
 
 # initialize the model
-model = DGSR(etypes=etypes, ntypes=ntypes, user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
+# model = DGSR(etypes=etypes, ntypes=ntypes, user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
+#              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
+model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
 if opt.load:
     state = torch.load(data_path + 'model_' + opt.load)

@@ -1,10 +1,16 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# @Time : 2021/11/17 3:29
+# @Author : ZM7
+# @File : DGSR
+# @Software: PyCharm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class DGSR(nn.Module):
-    def __init__(self, ntypes, etypes, user_num, item_num, input_dim, max_lookback, feat_drop=0.2, 
+    def __init__(self, user_num, item_num, input_dim, max_lookback, feat_drop=0.2, 
                  attn_drop=0.2, layer_num=3):
         super(DGSR, self).__init__()
         self.user_num = user_num
@@ -16,7 +22,7 @@ class DGSR(nn.Module):
         self.item_embedding = nn.Embedding(self.item_num, self.hidden_size)
         self.unified_map = nn.Linear(self.layer_num * self.hidden_size, 
                                      self.hidden_size, bias=False)
-        self.layers = nn.ModuleList([DGSRLayers(ntypes, etypes, self.hidden_size, max_lookback, feat_drop, attn_drop)
+        self.layers = nn.ModuleList([DGSRLayers(self.hidden_size, max_lookback, feat_drop, attn_drop)
                                      for _ in range(self.layer_num)])
         self.reset_parameters()
 
@@ -46,74 +52,116 @@ class DGSR(nn.Module):
 
 
 class DGSRLayers(nn.Module):
-    def __init__(self, ntypes, etypes, hidden_size, max_lookback, feat_drop=0.2, attn_drop=0.2):
+    def __init__(self, hidden_size, max_lookback, feat_drop=0.2, attn_drop=0.2):
         super(DGSRLayers, self).__init__()
         self.hidden_size = hidden_size
         # self.agg_gate_u = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
         # self.agg_gate_i = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
         self.feat_drop = nn.Dropout(feat_drop)
         self.atten_drop = nn.Dropout(attn_drop)
-        self.weight, self.key_encoder, self.val_encoder, self.rnn_weight = {}, {}, {}, {}
-        
-        for srctype, etype, dsttype in etypes:
-            self.weight[srctype] = nn.Linear(hidden_size, hidden_size, bias=False)
-            self.key_encoder[etype] = nn.Embedding(max_lookback, hidden_size)
-            self.val_encoder[etype] = nn.Embedding(max_lookback, hidden_size)
-            self.rnn_weight[dsttype] = nn.Linear(2 * hidden_size, hidden_size, bias=False)
-        
-        self.weight = nn.ModuleDict(self.weight)
-        self.key_encoder = nn.ModuleDict(self.key_encoder)
-        self.val_encoder = nn.ModuleDict(self.val_encoder)
-        self.rnn_weight = nn.ModuleDict(self.rnn_weight)
-            
-        self.conv, self.message, self.reduce, self.cross_reduce, self.update  = {}, {}, {}, {}, {}
-        for ntype in ntypes:
-            self.update[ntype] = self._get_update_func(self.rnn_weight[ntype])
-            self.conv[ntype] = self.weight[ntype]
-            self.cross_reduce[ntype] = lambda x: x.sum(-2)
-        for srctype, etype, dsttype in etypes:
-            self.message[etype] = self._get_message_func(srctype, dsttype)
-            self.reduce[etype] = self._get_reduce_func(srctype, dsttype, self.key_encoder[etype], self.val_encoder[etype])
+        self.user_weight = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.item_weight = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.user_update = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
+        self.item_update = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=False)
 
-    def _get_message_func(self, srctype, dsttype):
-        return lambda edges: {'time': edges.data['time'],
-                              f'{srctype}_h': edges.src[f'{srctype}_h'],
-                              f'{dsttype}_h': edges.dst[f'{dsttype}_h']}
+        # attention+ attention mechanism
+        # self.last_weight_u = nn.Linear(hidden_size, hidden_size, bias=False)
+        # self.last_weight_i = nn.Linear(hidden_size, hidden_size, bias=False)
 
-    def _get_update_func(self, rnn_weight):
-        return lambda user_now, user_old: F.tanh(rnn_weight(torch.cat([user_now, user_old], -1)))
-    
+        self.i_time_encoding = nn.Embedding(max_lookback, hidden_size)
+        self.i_time_encoding_k = nn.Embedding(max_lookback, hidden_size)
+        self.u_time_encoding = nn.Embedding(max_lookback, hidden_size)
+        self.u_time_encoding_k = nn.Embedding(max_lookback, hidden_size)
 
-    def _get_reduce_func(self, srctype, dsttype, val_embed, key_embed):
-        norm_const = torch.sqrt(torch.tensor(self.hidden_size).float())
-        def reduce_func(nodes):
-            order = nodes.mailbox['time']
-            src = nodes.mailbox[f'{srctype}_h']
-            dst = nodes.mailbox[f'{dsttype}_h']
-            re_order = order.max() - order
-            
-            e_ij = torch.sum((key_embed(re_order) + src) * dst, dim=2) / norm_const
-            alpha = self.atten_drop(F.softmax(e_ij, dim=1))
-            if len(alpha.shape) == 2:
-                alpha = alpha.unsqueeze(2)
-            h_long = torch.sum(alpha * (val_embed(re_order) + src), dim=1)
-            return {f'{dsttype}_h': h_long}
-        return reduce_func
+    def user_update_function(self, user_now, user_old):
+        return F.tanh(self.user_update(torch.cat([user_now, user_old], -1)))
+
+    def item_update_function(self, item_now, item_old):
+        return F.tanh(self.item_update(torch.cat([item_now, item_old], -1)))
 
     def forward(self, g, feat_dict=None):
         if feat_dict == None:
-            feat_dict = {ntype: g.nodes[ntype].data[f'{ntype}_h'] for ntype in g.ntypes}
+            user_ = g.nodes['user'].data['user_h']
+            item_ = g.nodes['item'].data['item_h']
         else:
-            feat_dict = {k: v.cuda() for k, v in feat_dict.items()}
-        for ntype in g.ntypes:
-            g.nodes[ntype].data[f'{ntype}_h'] = self.conv[ntype](self.feat_drop(feat_dict[ntype]))
-        g.multi_update_all({etype: (self.message[etype], self.reduce[etype]) for etype in g.etypes}, 'stack')
-        for ntype in g.ntypes:
-            new_feat = self.cross_reduce[ntype](g.nodes[ntype].data[f'{ntype}_h'])
-            g.nodes[ntype].data[f'{ntype}_h'] = self.update[ntype](new_feat, feat_dict[ntype])
-        feat_dict = {ntype: g.nodes[ntype].data[f'{ntype}_h'] for ntype in g.ntypes}
-        return feat_dict
-    
+            user_ = feat_dict['user'].cuda()
+            item_ = feat_dict['item'].cuda()
+        g.nodes['user'].data['user_h'] = self.user_weight(self.feat_drop(user_))
+        g.nodes['item'].data['item_h'] = self.item_weight(self.feat_drop(item_))
+        g.multi_update_all({'by': (self.user_message_func, self.user_reduce_func),
+                            'pby': (self.item_message_func, self.item_reduce_func)}, 'sum')
+        g.nodes['user'].data['user_h'] = self.user_update_function(g.nodes['user'].data['user_h'], user_)
+        g.nodes['item'].data['item_h'] = self.item_update_function(g.nodes['item'].data['item_h'], item_)
+        f_dict = {'user': g.nodes['user'].data['user_h'], 'item': g.nodes['item'].data['item_h']}
+        return f_dict
+
+    def item_message_func(self, edges):
+        dic = {}
+        dic['time'] = edges.data['time']
+        dic['user_h'] = edges.src['user_h']
+        dic['item_h'] = edges.dst['item_h']
+        return dic
+
+    def item_reduce_func(self, nodes):
+        order = nodes.mailbox['time']
+        re_order = order.max() - order
+        # order = torch.argsort(torch.argsort(nodes.mailbox['time'], 1), 1)
+        # re_order = nodes.mailbox['time'].shape[1] - order - 1
+
+        e_ij = torch.sum((self.i_time_encoding(re_order) + nodes.mailbox['user_h']) * nodes.mailbox['item_h'], dim=2)\
+                /torch.sqrt(torch.tensor(self.hidden_size).float())
+        alpha = self.atten_drop(F.softmax(e_ij, dim=1))
+        if len(alpha.shape) == 2:
+            alpha = alpha.unsqueeze(2)
+        h_long = torch.sum(alpha * (nodes.mailbox['user_h'] + self.i_time_encoding_k(re_order)), dim=1)
+
+        # length = nodes.mailbox['item_h'].shape[0]
+        # last = torch.argmax(nodes.mailbox['time'], 1)
+        # last_em = nodes.mailbox['user_h'][torch.arange(length), last, :].unsqueeze(1)
+        # e_ij1 = torch.sum(last_em * nodes.mailbox['user_h'], dim=2) / torch.sqrt(
+        #     torch.tensor(self.hidden_size).float())
+        # alpha1 = self.atten_drop(F.softmax(e_ij1, dim=1))
+        # if len(alpha1.shape) == 2:
+        #     alpha1 = alpha1.unsqueeze(2)
+        # h_short = torch.sum(alpha1 * nodes.mailbox['user_h'], dim=1)
+
+        # item_h = self.agg_gate_i(torch.cat([h_long, h_short], -1))
+        item_h = h_long
+        return {'item_h': item_h}
+
+    def user_message_func(self, edges):
+        dic = {}
+        dic['time'] = edges.data['time']
+        dic['item_h'] = edges.src['item_h']
+        dic['user_h'] = edges.dst['user_h']
+        return dic
+
+    def user_reduce_func(self, nodes):
+        order = nodes.mailbox['time']
+        re_order = order.max() - order
+        # order = torch.argsort(torch.argsort(nodes.mailbox['time'], 1),1)
+        # re_order = nodes.mailbox['time'].shape[1] - order - 1
+
+        e_ij = torch.sum((self.u_time_encoding(re_order) + nodes.mailbox['item_h']) *nodes.mailbox['user_h'],
+                            dim=2) / torch.sqrt(torch.tensor(self.hidden_size).float())
+        alpha = self.atten_drop(F.softmax(e_ij, dim=1))
+        if len(alpha.shape) == 2:
+            alpha = alpha.unsqueeze(2)
+        h_long = torch.sum(alpha * (nodes.mailbox['item_h'] + self.u_time_encoding_k(re_order)), dim=1)
+
+        # length = nodes.mailbox['user_h'].shape[0]
+        # last = torch.argmax(nodes.mailbox['time'], 1)
+        # last_em = nodes.mailbox['item_h'][torch.arange(length), last, :].unsqueeze(1)
+        # e_ij1 = torch.sum(last_em * nodes.mailbox['item_h'], dim=2)/torch.sqrt(torch.tensor(self.hidden_size).float())
+        # alpha1 = self.atten_drop(F.softmax(e_ij1, dim=1))
+        # if len(alpha1.shape) == 2:
+        #     alpha1 = alpha1.unsqueeze(2)
+        # h_short = torch.sum(alpha1 * nodes.mailbox['item_h'], dim=1)
+
+        # user_h = self.agg_gate_u(torch.cat([h_long, h_short], -1))
+        user_h = h_long
+        return {'user_h': user_h}
+
 
 def graph_user(bg, user_index, user_feats):
     b_user_size = bg.batch_num_nodes('user')
