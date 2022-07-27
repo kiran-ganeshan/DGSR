@@ -4,3 +4,4 @@
 **/static
 **/*.out
 **/model_*
+**/*_test.py

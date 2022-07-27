@@ -54,24 +54,23 @@ def generate(data, graph, item_num, max_lookback, t_cutoff,
     data = data.reset_index().groupby('time')
     keys = ['users', 'items', 'num_items']
     data = data.apply(lambda r: pd.Series([list(r[k]) for k in keys], index=keys))
-    data['num_users'] = data['users'].apply(lambda x: len(x))
-    max_users = data['num_users'].max()
-    def pad(data, key, padding=-1):
-        data[key] = data.apply(lambda r: [r[key] + (max_users - r['num_users']) * [padding]], axis=1)
-        data[key] = data[key].apply(lambda lst: lst[0])
-        return data
-    data = pad(data, 'users')
-    data = pad(data, 'items', padding=item_num * [-1])
-    data = pad(data, 'num_items')
+    # data['num_users'] = data['users'].apply(lambda x: len(x))
+    # max_users = data['num_users'].max()
+    # def pad(data, key, padding=-1):
+    #     data[key] = data.apply(lambda r: [r[key] + (max_users - r['num_users']) * [padding]], axis=1)
+    #     data[key] = data[key].apply(lambda lst: lst[0])
+    #     return data
+    # data = pad(data, 'users')
+    # data = pad(data, 'items', padding=item_num * [-1])
+    # data = pad(data, 'num_items')
     for t, row in data.iterrows():
         edges = {key: (graph.edges[key].data['time'] < t) & 
                       (graph.edges[key].data['time'] >= t - max_lookback) 
                       for key in graph.etypes}
         subgraph = dgl.edge_subgraph(graph, edges, relabel_nodes=False)
         rel_path = '/' + str(t) + '.bin'
-        keys = ['items', 'users', 'num_items', 'num_users']
+        keys = ['items', 'users', 'num_items']
         labels = {key: torch.tensor([row[key]]).long() for key in keys}
-        labels = {**labels, 'time': torch.tensor([t]).long()}
         if t == t_cutoff and val_path is not None:
             dgl.save_graphs(val_path + rel_path, subgraph, labels)
             val_num += 1
@@ -151,10 +150,12 @@ def generate_user(user, data, graph, max_lookback, t_cutoff,
     return train_num, val_num, test_num
 
 
-def generate_data(data, graph, item_num, max_lookback, train_path, test_path, val_path, test_num, bucket, k_hop):
+def generate_data(data, graph, item_num, max_lookback, train_path, test_path, val_path, test_num, k_hop):
     times = np.sort(np.unique(data['time'].values))
     users = np.sort(np.unique(data['user_id'].values))
     t_cutoff = times[-test_num - 1]
+    return generate(data, graph, item_num, max_lookback, 
+                    t_cutoff, train_path, test_path, val_path)
     if bucket:
         return generate(data, graph, item_num, max_lookback, 
                         t_cutoff, train_path, test_path, val_path)
