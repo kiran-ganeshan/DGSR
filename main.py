@@ -32,19 +32,20 @@ parser.add_argument('--batch_size', type=int, default=50, help='input batch size
 parser.add_argument('--hidden_size', type=int, default=50, help='hidden state size')
 parser.add_argument("--test_num", type=int, default=4, help='Number of test times')
 parser.add_argument("--k_hop", type=int, default=3, help='Number of hops in preprocessing')
+parser.add_argument("--margin", action='store_true', default=False, help='Use multilabel margin loss')
 parser.add_argument("--max_users", type=int, default=25, help='Maximum number of sampled users per hop')
 parser.add_argument("--max_items", type=int, default=5, help='Maximum number of sampled items per hop')
 parser.add_argument('--epoch', type=int, default=30, help='number of epochs to train for')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
 parser.add_argument('--l2', type=float, default=0.0001, help='l2 penalty')
 parser.add_argument('--feat_drop', type=float, default=0.0, help='drop_out')
-parser.add_argument('--attn_drop', type=float, default=0.0, help='drop_out')
-parser.add_argument('--mean', action='store_true', default=False, help='Train to mean')
+parser.add_argument('--attn_drop', type=float, default=0.2, help='drop_out')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
+parser.add_argument('--neg_num', type=int, default=1000, help='Number of negatives to sample')
 parser.add_argument('--max_lookback', type=int, default=25, help='maximum lookback in original time')
 parser.add_argument('--gpu', default='2')
 parser.add_argument("--val", action='store_true', default=False)
-parser.add_argument("--debug", action='store_true', default=False, help='debug mode (model not saved)')
+parser.add_argument("--nosave", action='store_true', default=False, help='model and outputs not saved')
 parser.add_argument("--run_id", type=str, default='', help='Additional identifier for run (outside of hparams)')
 
 opt = parser.parse_args()
@@ -55,8 +56,9 @@ print(f"device: {device}")
 print(f"opt: {opt}")
 
 # loading data (and preprocessing if necessary)
-data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}"
-run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}_tm{opt.mean}_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
+data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.val}"
+run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_l2{opt.l2}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
+run_id += '_' + ('margin' if opt.margin else 'bce')
 if opt.run_id:
     run_id = opt.run_id + '_' + run_id
 data_path = 'static/' + data_id + '/'
@@ -69,7 +71,9 @@ neg_path = data_path + 'neg'
 out_folder = 'results/' + data_id + '/'
 mkdir_if_not_exist(out_folder)
 out_file = out_folder + run_id + '.out'
-model_file = data_path + 'model_' + run_id
+results_path = data_path + run_id + '/'
+mkdir_if_not_exist(results_path)
+model_file = results_path + 'model'
 sys.stdout = open(out_file, 'w+')
 def preprocess():
     print('start preprocessing:', datetime.datetime.now(), flush=True)
@@ -96,20 +100,20 @@ def preprocess():
         save_graphs(graph_path, graph)
     else:
         graph = dgl.load_graphs(graph_path)[0][0]
-    metadata = {**metadata, 'ntypes': graph.ntypes, 'etypes': graph.canonical_etypes}
+    metadata = {**metadata, 'etypes': graph.canonical_etypes}
         
     # data
     print('start data generation:', datetime.datetime.now(), flush=True)
-    train_num, val_num, test_num = generate_data(data, graph, metadata['item_num'], opt.max_lookback, 
-                                                 train_path, test_path, val_path, opt.test_num, opt.k_hop)
+    train_num, val_num, test_num = generate_data(data, graph, opt.max_lookback, train_path, test_path, val_path, 
+                                                 opt.test_num, opt.k_hop)
     
     # save metadata (last to indicate completion)
     with open(metadata_path, 'wb') as file:
         pickle.dump(metadata, file)
         
-    print('The number of train set: ', train_num, flush=True)
-    print('The number of val set: ', val_num, flush=True)
-    print('The number of test set: ', test_num, flush=True)
+    print('The number of train set: ', train_num // opt.batch_size, flush=True)
+    print('The number of val set: ', val_num // opt.batch_size, flush=True)
+    print('The number of test set: ', test_num // opt.batch_size, flush=True)
     print('End preprocessing: ', datetime.datetime.now(), flush=True)
 if not os.path.exists(metadata_path):
     preprocess()
@@ -120,36 +124,56 @@ with open(metadata_path, 'rb') as file:
     user_num = metadata['user_num']
     item_num = metadata['item_num']
     etypes = metadata['etypes']
-    ntypes = metadata['ntypes']
 
 train_set = StaticData(train_path)
 test_set = StaticData(test_path)
 if opt.val:
     val_set = StaticData(val_path)
 
-print('train number: ', train_set.size)
-print('test number: ', test_set.size)
+find_num_batches = lambda size: size // opt.batch_size + (size % opt.batch_size > 0)
+print('device: ', device)
+print('train number: ', find_num_batches(train_set.size))
+print('test number: ', find_num_batches(test_set.size))
 print('user number: ', user_num)
 print('item number: ', item_num)
 with open(neg_path, 'rb') as f:
     data_neg = pickle.load(f) # negatives for evaluation
-collate = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, opt.mean)
-collate_test = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, opt.mean, data_neg)
-train_data = DataLoader(dataset=train_set, batch_size=opt.batch_size, collate_fn=collate, shuffle=True, pin_memory=True, num_workers=30)
-test_data = DataLoader(dataset=test_set, batch_size=opt.batch_size, collate_fn=collate_test, pin_memory=True, num_workers=12)
+collate = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, 
+                      opt.margin, neg_num=opt.neg_num)
+collate_test = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, 
+                           opt.margin, data_neg, opt.neg_num)
+train_data = DataLoader(dataset=train_set, 
+                        batch_size=opt.batch_size, 
+                        collate_fn=collate, 
+                        shuffle=True, 
+                        pin_memory=True, 
+                        num_workers=30)
+test_data = DataLoader(dataset=test_set, 
+                       batch_size=opt.batch_size, 
+                       collate_fn=collate_test, 
+                       shuffle=True, 
+                       pin_memory=True, 
+                       num_workers=12)
 if opt.val:
-    val_data = DataLoader(dataset=val_set, batch_size=opt.batch_size, collate_fn=collate_test, pin_memory=True, num_workers=2)
+    val_data = DataLoader(dataset=val_set, 
+                          batch_size=opt.batch_size, 
+                          collate_fn=collate_test, 
+                          pin_memory=True, 
+                          num_workers=2)
 
 # initialize the model
-model = DGSR(etypes=etypes, ntypes=ntypes, user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
-             feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
+model = DGSR(etypes=etypes, user_num=user_num, item_num=item_num, 
+             input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
+             feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, 
+             layer_num=opt.layer_num).cuda()
 # model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
 #              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
 if opt.load:
     state = torch.load(data_path + 'model_' + opt.load)
     model.load_state_dict(state)
 optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.l2)
-loss_func = nn.BCEWithLogitsLoss(reduction='mean').to(device)
+Loss = nn.MultiLabelMarginLoss if opt.margin else nn.BCEWithLogitsLoss
+loss_func = Loss(reduction='mean').to(device)
 best = {}
 stop_num = 0
 epoch_start = None
@@ -174,15 +198,20 @@ for epoch in range(opt.epoch):
         batch_graph = batch_graph.to(device)
         user = user.cuda()
         target = target.cuda()
-        
         score = model(batch_graph, user, is_training=True)
+        if opt.margin:
+            score = torch.sigmoid(score)
         loss = loss_func(score, target)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         epoch_loss += loss.detach().cpu().item()
         if iter % 1000 == 0:
+            if not opt.nosave:
+                torch.save(score, results_path + f"score_{epoch}_{iter}")
             print('\tIter {}, loss {:.4f}'.format(iter, epoch_loss/iter), datetime.datetime.now(), flush=True)
+        del batch_graph, user, target, loss, score
+        torch.cuda.empty_cache()
     epoch_loss /= iter
     ###############################################################
 
@@ -201,11 +230,23 @@ for epoch in range(opt.epoch):
                 all_label = all_label.cuda()
                 num_pos = num_pos.cuda()
                 score, all_score = model(batch_graph, user, all_label=all_label, is_training=False)
+                if opt.margin:
+                    score = torch.sigmoid(score)
                 loss = loss_func(score, target)
                 val_loss += loss.cpu().item()
+                perm = torch.randperm(all_score.shape[-1])
+                all_score = -all_score[..., perm]
                 rank = all_score.argsort(-1).argsort(-1)
+                rank = rank[..., torch.argsort(perm)]
                 ranks.append(rank)
                 neg_idxs.append(num_pos)
+                if not opt.nosave:
+                    all_score = all_score[..., torch.argsort(perm)]
+                    torch.save(score, results_path + f"val_score_{epoch}_{iter}")
+                    torch.save(rank, results_path + f"val_rank_{epoch}_{iter}")
+                    torch.save(all_score, results_path + f"val_all_score_{epoch}_{iter}")
+                del batch_graph, user, score, target, loss, all_label, all_score, perm
+                torch.cuda.empty_cache()
             ranks = [rank.detach().cpu().numpy() for rank in ranks]
             results = eval_metric(ranks, neg_idxs)
             results_str = '\n'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
@@ -227,13 +268,25 @@ for epoch in range(opt.epoch):
             all_label = all_label.cuda()
             num_pos = num_pos.cuda()
             score, all_score = model(batch_graph, user, all_label=all_label, is_training=False)
+            if opt.margin:
+                score = torch.sigmoid(score)
             loss = loss_func(score, target)
             test_loss += loss.cpu().item()
+            perm = torch.randperm(all_score.shape[-1])
+            all_score = -all_score[..., perm]
             rank = all_score.argsort(-1).argsort(-1)
+            rank = rank[..., torch.argsort(perm)]
             ranks.append(rank)
             neg_idxs.append(num_pos)
             if iter % 200 == 0:
+                if not opt.nosave:
+                    all_score = all_score[..., torch.argsort(perm)]
+                    torch.save(score, results_path + f"test_score_{epoch}_{iter}")
+                    torch.save(rank, results_path + f"test_rank_{epoch}_{iter}")
+                    torch.save(all_score, results_path + f"test_all_score_{epoch}_{iter}")
                 print('\tIter {}, test_loss {:.4f}'.format(iter, test_loss / iter), datetime.datetime.now(), flush=True)
+            del user, target, score, loss, all_label, perm, all_score
+            torch.cuda.empty_cache()
         ranks = torch.cat(ranks, 0)
         neg_idxs = torch.cat(neg_idxs, 0)
         results = eval_metric(ranks, neg_idxs, device)
@@ -241,7 +294,7 @@ for epoch in range(opt.epoch):
         if metric_name not in best or val > best[metric_name][0]:
             stop = metric_name not in best   # stop=False when val exceeds best_result
             best[metric_name] = (val, epoch)
-        if epoch == best[metric_name][1] and not opt.debug:
+        if epoch == best[metric_name][1] and not opt.nosave:
             file_add = '' if metric_name == 'recall@10' else f'_{metric_name}'
             torch.save(model.state_dict(), model_file + file_add)
     if stop:

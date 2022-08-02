@@ -48,57 +48,40 @@ def user_neg(data, item_num):
     u_item = data.groupby('user_id')['item_id']
     return u_item.apply(lambda x: np.setdiff1d(all_item, x))
 
-def neg_generate(user, label, data_neg, neg_num=100):
-    label = label.numpy()
-    neg = np.zeros(user.shape + (neg_num,), np.int32)
-    idx_flags = (label == -1) * np.arange(label.shape[-1], 0, -1)
-    first_idx = np.argmax(idx_flags, -1)        # first idx to be -1 along last dim
-    has_idx = np.max(label == -1, -1)           # whether there is a -1
+def neg_generate(user, label, neg_num=100, data_neg=None, item_num=None):
+    if item_num:
+        neg_num = 0
+        label = pad(label, item_num)
+    label = label.numpy()   
+    B, T = label.shape                          # number of batches and max targets per batch
+    neg = np.zeros((B, neg_num), np.int32)
+    idx_flags = (label == -1) * np.arange(T, 0, -1)
+    first_neg = np.argmax(idx_flags, -1)        # first idx to be -1 along last dim
+    has_neg = np.max(label == -1, -1)           # whether there is a -1
     for i, u in enumerate(user):
-        neg_choices = data_neg[u.item()]
-        neg[i] = np.random.choice(neg_choices, neg_num)
-        if has_idx[i]:                          # replace any -1s in label with neg samples
-            idx = first_idx[i].item()
-            label[i, idx:] = np.random.choice(neg_choices, label.shape[-1] - idx)
+        if item_num:
+            neg_choices = np.setdiff1d(np.arange(item_num), label[i, :first_neg[i]])
+        elif data_neg:
+            neg_choices = data_neg[u.item()]
+        neg[i] = np.random.choice(neg_choices, neg_num, replace=False)
+        if has_neg[i]:                          # replace any -1s in label with neg samples
+            idx = first_neg[i].item()
+            label[i, idx:] = np.random.choice(neg_choices, T - idx, replace=False)
     all_label = torch.tensor(np.concatenate([label, neg], axis=-1)).long() 
-    first_idx = torch.tensor(first_idx)
-    return all_label, first_idx
+    first_neg = torch.tensor(first_neg)
+    return all_label, first_neg
 
-# def sample_users(user, label, target, num_user, num_target, n_user):
-#     T, U, I = target.shape
-#     _, _, L = label.shape
-#     num_extra = n_user - U
-#     assert num_extra > 0, f"max number of users is {U} but n_user is only {n_user}"
-#     extra_user = torch.empty((T, num_extra)).long()
-#     extra_target = torch.empty((T, num_extra, I)).float()
-#     extra_num_target = torch.empty((T, num_extra)).long()
-#     extra_label = torch.empty((T, num_extra, L)).long()
-#     for t, nu in enumerate(num_user):
-#         nu = nu.item()
-#         samples = np.random.choice(nu, user.shape[1] - nu)
-#         user[t, nu:] = user[t, samples]
-#         target[t, nu:, :] = target[t, samples, :]
-#         num_target[t, nu:] = num_target[t, samples]
-#         label[t, nu:] = label[t, samples]
-#         samples = np.random.choice(nu, num_extra)
-#         extra_user[t, :] = user[t, samples]
-#         extra_target[t, :, :] = target[t, samples, :]
-#         extra_num_target[t, :] = num_target[t, samples]
-#         extra_label[t, :, :] = label[t, samples, :]
-#     user = torch.cat([user, extra_user], 1)
-#     target = torch.cat([target, extra_target], 1)
-#     num_target = torch.cat([num_target, extra_num_target], 1)
-#     label = torch.cat([label, extra_label], 1)
-#     return user, label, target, num_target
-
-def multihot(label, num_target, item_num, mean):
+def multihot(label, num_target, item_num):
     T, _ = label.shape
     target = -torch.ones((T, item_num), dtype=torch.float)
     for t in range(T):
-        l = label[t, :num_target[t]].long()
-        l = one_hot(l, num_classes=item_num).float()
-        target[t, :] = l.mean(-2) if mean else l.sum(-2)
+        target[t, :] = one_hot(label[t, :num_target[t]], num_classes=item_num).float().sum(-2)
     return target
+
+def pad(label, item_num):
+    B, I = label.shape
+    return torch.cat([label, -torch.ones((B, item_num - I)).long()], -1)
+    
 
 empty = lambda: torch.tensor([]).long()
 def empty_like(graph):
@@ -143,38 +126,48 @@ def subsample(graph, user, max_items, max_users, k):
     
     
 
-def get_collate(item_num, max_items, max_users, k_hop, mean, data_neg=None):
+def get_collate(item_num, max_items, max_users, k_hop, 
+                data_neg=None, margin=False, neg_num=100, all_item=False, multiplier=1):
     def collate(data):
         # gather data
         user, graphs, label, num_target = [], [], [], []
         for graph, labels in data:
             u = labels['users'].long()
-            graph = subsample(graph, u, max_items, max_users, k_hop)
+            graph = [subsample(graph, u, max_items, max_users, k_hop) for _ in multiplier]
             user.append(u)
-            graphs.append(graph)
+            graphs.extend(graph)
             label.append(labels['items'])
             num_target.append(labels['num_items'])
         # batch and move to torch
-        user = torch.cat(user).long()
+        user = torch.cat(user).squeeze().long()
         graphs = dgl.batch(graphs)
-        label = torch.cat(label).float()
+        label = torch.cat(label).long()
         num_target = torch.cat(num_target).long()
         # multihot-encode target and sample remaining users
-        target = multihot(label, num_target, item_num, mean)
+        if margin:
+            target = pad(label, item_num)
+        else:
+            target = multihot(label, num_target, item_num)
         # generate negatives if required
-        tup = () if data_neg is None else neg_generate(user, label, data_neg)
-        # move to cuda
-        #graph = graph.to(device)
-        #user = user.to(device)
-        #new_target = new_target.to(device)
+        if all_item:
+            tup = neg_generate(user, label, item_num=item_num)
+        elif not (data_neg is None):
+            tup = neg_generate(user, label, neg_num, data_neg)
+        else:
+            tup = ()
+        if multiplier != 1:
+            user = user.repeat(multiplier)
+            target = target.repeat(multiplier, 1)
+            all_label, first_neg = tup
+            all_label = all_label.repeat(multiplier, 1)
+            first_neg = first_neg.repeat(multiplier)
+            tup = (all_label, first_neg)
         return graphs, user, target, *tup
     return collate
 
 def eval_metric(ranks, neg_idxs, device, ats=[5, 10, 20]):
     recalls = {at: [] for at in ats}
     ndcgs = {at: ([], []) for at in ats}
-    ranks = ranks.reshape((-1, ranks.shape[-1]))
-    neg_idxs = neg_idxs.reshape(-1) 
     idxs = torch.arange(0, ranks.shape[-1], device=device).unsqueeze(0)
     zero = torch.tensor(0., device=device)
     mask = idxs < neg_idxs.unsqueeze(1)

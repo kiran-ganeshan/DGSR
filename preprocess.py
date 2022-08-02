@@ -41,15 +41,16 @@ def generate_graph(data):
     graph.nodes['item'].data['item_id'] = torch.tensor(np.unique(item)).long()
     return graph
 
-def generate(data, graph, item_num, max_lookback, t_cutoff,
+def generate(data, graph, max_lookback, t_cutoff,
              train_path, test_path, val_path):
     train_num, test_num, val_num = 0, 0, 0
     data = data.rename(columns={'user_id': 'users', 'item_id': 'items'})
     data = data.groupby(['time', 'users'])
     data = pd.DataFrame({'items': data['items'].apply(lambda x: list(x))})
     data['num_items'] = data['items'].apply(lambda x: len(x))
+    max_num_items = data['num_items'].max()
 
-    data['items'] = data.apply(lambda r: [r['items'] + (item_num - r['num_items']) * [-1]], axis=1)
+    data['items'] = data.apply(lambda r: [r['items'] + (max_num_items - r['num_items']) * [-1]], axis=1)
     data['items'] = data['items'].apply(lambda lst: lst[0])
     data = data.reset_index().groupby('time')
     keys = ['users', 'items', 'num_items']
@@ -150,11 +151,11 @@ def generate_user(user, data, graph, max_lookback, t_cutoff,
     return train_num, val_num, test_num
 
 
-def generate_data(data, graph, item_num, max_lookback, train_path, test_path, val_path, test_num, k_hop):
+def generate_data(data, graph, max_lookback, train_path, test_path, val_path, test_num, k_hop):
     times = np.sort(np.unique(data['time'].values))
     users = np.sort(np.unique(data['user_id'].values))
     t_cutoff = times[-test_num - 1]
-    return generate(data, graph, item_num, max_lookback, 
+    return generate(data, graph, max_lookback, 
                     t_cutoff, train_path, test_path, val_path)
     if bucket:
         return generate(data, graph, item_num, max_lookback, 
