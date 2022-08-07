@@ -64,11 +64,14 @@ class Reduce(nn.Module):
         self.value = nn.Linear(hidden_size, hidden_size)
         self.atten_drop = nn.Dropout(attn_drop)
         self.norm_const = torch.sqrt(torch.tensor(hidden_size).float())
+        self.max_lookback = max_lookback
 
     def forward(self, nodes):
         order = nodes.mailbox['time']
         src = nodes.mailbox['h']
         dst = nodes.mailbox['k']
+        # if order.max() - order.min() >= self.max_lookback:
+        #     print(order.min(), order.max(), self.max_lookback, flush=True)
         re_order = order.max() - order
         key_embed = self.key_embed(re_order)
         val_embed = self.val_embed(re_order)
@@ -119,10 +122,7 @@ class DGSRLayers(nn.Module):
         update_dict = {etype: (self.message, self.reduce[etype]) for etype in g.etypes}
         g.multi_update_all(update_dict, 'stack', self.cross_reduce)
         for ntype in g.ntypes:
-            shape = g.nodes[ntype].data['h'].shape
             g.nodes[ntype].data['h'] = self.update[ntype](g.nodes[ntype].data['h'], feat_dict[ntype])
-            later_shape = g.nodes[ntype].data['h'].shape
-            assert shape == later_shape, f"before: {shape}\nafter: {later_shape}"
         feat_dict = {ntype: g.nodes[ntype].data['h'] for ntype in g.ntypes}
         return feat_dict
     

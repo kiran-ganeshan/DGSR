@@ -157,13 +157,6 @@ def generate_data(data, graph, max_lookback, train_path, test_path, val_path, te
     t_cutoff = times[-test_num - 1]
     return generate(data, graph, max_lookback, 
                     t_cutoff, train_path, test_path, val_path)
-    if bucket:
-        return generate(data, graph, item_num, max_lookback, 
-                        t_cutoff, train_path, test_path, val_path)
-    generate_func = lambda u: generate_user(u, data, graph, max_lookback, t_cutoff, 
-                                            train_path, test_path, val_path, k_hop)
-    a = Parallel(n_jobs=10)(delayed(generate_func)(u) for u in users)
-    return tuple([sum(tup) for tup in zip(*a)])
     
 
 

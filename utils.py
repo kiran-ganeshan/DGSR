@@ -127,19 +127,19 @@ def subsample(graph, user, max_items, max_users, k):
     
 
 def get_collate(item_num, max_items, max_users, k_hop, 
-                data_neg=None, margin=False, neg_num=100, all_item=False, multiplier=1):
+                train=True, margin=False, multiplier=1):
     def collate(data):
         # gather data
         user, graphs, label, num_target = [], [], [], []
         for graph, labels in data:
             u = labels['users'].long()
-            graph = [subsample(graph, u, max_items, max_users, k_hop) for _ in multiplier]
+            graph = [subsample(graph, u, max_items, max_users, k_hop) for _ in range(multiplier)]
             user.append(u)
             graphs.extend(graph)
             label.append(labels['items'])
             num_target.append(labels['num_items'])
         # batch and move to torch
-        user = torch.cat(user).squeeze().long()
+        user = torch.cat(user).long()
         graphs = dgl.batch(graphs)
         label = torch.cat(label).long()
         num_target = torch.cat(num_target).long()
@@ -149,32 +149,32 @@ def get_collate(item_num, max_items, max_users, k_hop,
         else:
             target = multihot(label, num_target, item_num)
         # generate negatives if required
-        if all_item:
-            tup = neg_generate(user, label, item_num=item_num)
-        elif not (data_neg is None):
-            tup = neg_generate(user, label, neg_num, data_neg)
-        else:
-            tup = ()
         if multiplier != 1:
             user = user.repeat(multiplier)
             target = target.repeat(multiplier, 1)
-            all_label, first_neg = tup
-            all_label = all_label.repeat(multiplier, 1)
-            first_neg = first_neg.repeat(multiplier)
-            tup = (all_label, first_neg)
-        return graphs, user, target, *tup
+        if not train:
+            return graphs, user, target, label, num_target
+        else:
+            return graphs, user, target
     return collate
 
-def eval_metric(ranks, neg_idxs, device, ats=[5, 10, 20]):
+def eval_metric(top, label, num_pos, ats=[5, 10, 20]):
     recalls = {at: [] for at in ats}
     ndcgs = {at: ([], []) for at in ats}
-    idxs = torch.arange(0, ranks.shape[-1], device=device).unsqueeze(0)
-    zero = torch.tensor(0., device=device)
-    mask = idxs < neg_idxs.unsqueeze(1)
-    cum_gain = lambda mask, ranks: torch.where(mask, 1 / torch.log2(ranks + 2), zero).sum(-1)
+    B, K = top.shape
+    _, I = label.shape
+    top = top.unsqueeze(1)
+    label = label.unsqueeze(2)
+    ranks = torch.arange(K).cuda().unsqueeze(0).unsqueeze(0)
+    cgs = 1. / torch.log2(ranks + 2)
+    matches = (top == label)
+    mask = (torch.arange(I).cuda().unsqueeze(0) < num_pos.unsqueeze(1)).unsqueeze(-1)
     for at in ats:
-        recalls[at] = ((ranks < at) * mask).float().sum(-1) / mask.float().sum(-1)
-        ndcgs[at] = cum_gain((ranks < at) * mask, ranks) / cum_gain(mask, idxs)
+        cg = cgs[:, :, :at]
+        match = matches[:, :, :at]
+        m = mask[:, :, :at]
+        recalls[at] = match.sum((1, 2)) / num_pos
+        ndcgs[at] = (match * cg).sum((1, 2)) / (m * cg).sum((1, 2))
     recalls = {f'recall@{at}': val.mean(0).cpu().numpy().item() for at, val in recalls.items()}
     ndcgs = {f'ndcg@{at}': val.mean(0).cpu().numpy().item() for at, val in ndcgs.items()}
     return {**recalls, **ndcgs}
