@@ -41,8 +41,7 @@ def generate_graph(data):
     graph.nodes['item'].data['item_id'] = torch.tensor(np.unique(item)).long()
     return graph
 
-def generate(data, graph, max_lookback, t_cutoff,
-             train_path, test_path, val_path):
+def generate(data, graph, max_lookback, t_cutoff, train_path, test_path, val_path):
     train_num, test_num, val_num = 0, 0, 0
     data = data.rename(columns={'user_id': 'users', 'item_id': 'items'})
     data = data.groupby(['time', 'users'])
@@ -71,7 +70,8 @@ def generate(data, graph, max_lookback, t_cutoff,
         subgraph = dgl.edge_subgraph(graph, edges, relabel_nodes=False)
         rel_path = '/' + str(t) + '.bin'
         keys = ['items', 'users', 'num_items']
-        labels = {key: torch.tensor([row[key]]).long() for key in keys}
+        labels = {key: torch.tensor(row[key]).long() for key in keys}
+        labels = {**labels, 'time': torch.tensor([t]).long().repeat(labels['users'].shape[0])}
         if t == t_cutoff and val_path is not None:
             dgl.save_graphs(val_path + rel_path, subgraph, labels)
             val_num += 1
@@ -153,7 +153,6 @@ def generate_user(user, data, graph, max_lookback, t_cutoff,
 
 def generate_data(data, graph, max_lookback, train_path, test_path, val_path, test_num, k_hop):
     times = np.sort(np.unique(data['time'].values))
-    users = np.sort(np.unique(data['user_id'].values))
     t_cutoff = times[-test_num - 1]
     return generate(data, graph, max_lookback, 
                     t_cutoff, train_path, test_path, val_path)

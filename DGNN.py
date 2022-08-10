@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DGSR(nn.Module):
+class DGNN(nn.Module):
     def __init__(self, etypes, user_num, item_num, input_dim, max_lookback, feat_drop=0.2, 
                  attn_drop=0.2, layer_num=3):
-        super(DGSR, self).__init__()
+        super(DGNN, self).__init__()
         self.user_num = user_num
         self.item_num = item_num
         self.hidden_size = input_dim
@@ -16,7 +16,7 @@ class DGSR(nn.Module):
         self.item_embedding = nn.Embedding(self.item_num, self.hidden_size)
         self.unified_map = nn.Linear(self.layer_num * self.hidden_size, 
                                      self.hidden_size, bias=False)
-        self.layers = nn.ModuleList([DGSRLayers(etypes, self.hidden_size, max_lookback, feat_drop, attn_drop)
+        self.layers = nn.ModuleList([DGNNLayer(etypes, self.hidden_size, max_lookback, feat_drop, attn_drop)
                                      for _ in range(self.layer_num)])
         self.reset_parameters()
 
@@ -67,16 +67,15 @@ class Reduce(nn.Module):
         self.max_lookback = max_lookback
 
     def forward(self, nodes):
-        order = nodes.mailbox['time']
+        pred_time = nodes.mailbox['predict_time']
+        time = nodes.mailbox['time']
         src = nodes.mailbox['h']
         dst = nodes.mailbox['k']
-        # if order.max() - order.min() >= self.max_lookback:
-        #     print(order.min(), order.max(), self.max_lookback, flush=True)
-        re_order = order.max() - order
+        re_order = pred_time - time - 1
         key_embed = self.key_embed(re_order)
         val_embed = self.val_embed(re_order)
-        query = self.query(src)
-        key = self.key(dst)
+        query = self.query(dst)
+        key = self.key(src)
         val = self.value(src)
         e_ij = torch.sum((key_embed + key) * query, dim=2) / self.norm_const
         alpha = self.atten_drop(F.softmax(e_ij, dim=1))
@@ -93,9 +92,9 @@ class CrossReduce(nn.Module):
             h = h.sum(-2)
         return {'h': h}
 
-class DGSRLayers(nn.Module):
+class DGNNLayer(nn.Module):
     def __init__(self, etypes, hidden_size, max_lookback, feat_drop=0.2, attn_drop=0.2):
-        super(DGSRLayers, self).__init__()
+        super(DGNNLayer, self).__init__()
         self.hidden_size = hidden_size
 
         self.feat_drop = nn.Dropout(feat_drop)
@@ -110,7 +109,7 @@ class DGSRLayers(nn.Module):
         self.update = nn.ModuleDict(self.update)
 
         self.cross_reduce = CrossReduce()
-        self.message = lambda e: {'time': e.data['time'], 'h': e.src['h'], 'k': e.dst['h']}
+        self.message = lambda e: {**e.data, 'h': e.src['h'], 'k': e.dst['h']}
 
     def forward(self, g, feat_dict=None):
         if feat_dict == None:

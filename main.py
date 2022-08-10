@@ -9,7 +9,7 @@ import datetime
 import torch
 import pandas as pd
 import numpy as np
-from DGSR import DGSR
+from DGNN import DGNN
 import dgl
 import pickle
 from utils import StaticData
@@ -43,7 +43,7 @@ parser.add_argument('--l2', type=float, default=0.0001, help='l2 penalty')
 parser.add_argument('--feat_drop', type=float, default=0.0, help='drop_out')
 parser.add_argument('--attn_drop', type=float, default=0.2, help='drop_out')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
-parser.add_argument('--neg_num', type=int, default=1000, help='Number of negatives to sample')
+parser.add_argument('--neg_num', type=int, default=100, help='Number of negatives to sample')
 parser.add_argument('--max_lookback', type=int, default=25, help='maximum lookback in original time')
 parser.add_argument('--gpu', default='2')
 parser.add_argument("--val", action='store_true', default=False)
@@ -165,7 +165,7 @@ if opt.val:
                           num_workers=2)
 
 # initialize the model
-model = DGSR(etypes=etypes, user_num=user_num, item_num=item_num, 
+model = DGNN(etypes=etypes, user_num=user_num, item_num=item_num, 
              input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, 
              layer_num=opt.layer_num).cuda()
@@ -198,14 +198,14 @@ for epoch in range(opt.epoch):
     epoch_start = curr_time
     model.train()
     for batch_graph, user, target in train_data:
+        # print(user.shape, target.shape)
         iter += 1
         batch_graph = batch_graph.to(device)
         user = user.cuda()
         target = target.cuda()
-        #target = torch.zeros(target.shape).cuda()
         score = model(batch_graph, user)
-        if opt.margin:
-            score = torch.sigmoid(score)
+        # if opt.margin:
+        #     score = torch.sigmoid(score)
         loss = loss_func(score, target)
         optimizer.zero_grad()
         loss.backward()
@@ -225,24 +225,30 @@ for epoch in range(opt.epoch):
     iter = 0
     if opt.val:
         print('start validation: ', datetime.datetime.now())
-        top_items, num_targets, labels = [], [],  []
+        top_items, sample_top_items, num_targets, labels = [], [], [], []
         ats = [5, 10, 20]
         with torch.no_grad:
             for batch_graph, user, target, label, num_target in val_data:
                 iter += 1
                 batch_graph = batch_graph.to(device)
                 user = user.cuda()
+                target = target.cuda()
                 label = label.cuda()
                 num_target = num_target.cuda()
                 score = model(batch_graph, user)
+                loss = loss_func(score, target)
+                val_loss += loss.detach().cpu().item()
                 score = score.reshape(-1, opt.multiplier, item_num).mean(1)
+                num_erase = score.shape[1] - num_target.max() - opt.neg_num
+                erase_prob = torch.max(torch.tensor(0.), 1. - target)
+                erase_idx = torch.multinomial(erase_prob, num_erase)
+                sample_score = torch.clone(score)
                 for i in range(score.shape[0]):
-                    num_erase = score.shape[1] - num_target[i] - 4000
-                    erase_prob = torch.max(torch.tensor(0.), 1. - target[i, :])
-                    erase_idx = torch.multinomial(erase_prob, num_erase)
-                    score[i, erase_idx] = score.min()
+                    sample_score[i, erase_idx[i, :]] = score[i, :].min()
                 _, top_item = torch.topk(score, max(ats), -1)
+                _, sample_top_item = torch.topk(sample_score, max(ats), -1)
                 top_items.append(top_item)
+                sample_top_items.append(sample_top_item)
                 num_targets.append(num_target)
                 labels.append(label)
                 if iter % (test_set.size // 1000) == 0:
@@ -253,15 +259,17 @@ for epoch in range(opt.epoch):
                 #torch.cuda.empty_cache()
             label = torch.cat(labels, 0)
             top_item = torch.cat(top_items, 0)
+            sample_top_item = torch.cat(sample_top_items, 0)
             num_target = torch.cat(num_targets, 0)
-            results = eval_metric(top_item, label, num_target, ats)
-            results_str = '\n'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
-            print(results_str, flush=True)
+            for name, top in zip(["true", "sampling"], [top_item, sample_top_item]):
+                results = eval_metric(top, label, num_target, ats)
+                results_str = '\n\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
+                print(f"{name} results:\n\t" + results_str, flush=True)
     ###############################################################
     
     ############################ test ############################
     print('start testing: ', datetime.datetime.now())
-    top_items, num_targets, labels = [], [], []
+    top_items, sample_top_items, num_targets, labels = [], [], [], []
     iter = 0
     ats = [5, 10, 20]
     with torch.no_grad():
@@ -274,15 +282,18 @@ for epoch in range(opt.epoch):
             num_target = num_target.cuda()
             score = model(batch_graph, user)
             loss = loss_func(score, target)
-            test_loss += loss.detach().cpu().numpy()
+            test_loss += loss.detach().cpu().item()
             score = score.reshape(-1, opt.multiplier, item_num).mean(1)
-            # for i in range(score.shape[0]):
-            #     num_erase = score.shape[1] - num_target[i] - 4000
-            #     erase_prob = torch.max(torch.tensor(0.), 1. - target[i, :])
-            #     erase_idx = torch.multinomial(erase_prob, num_erase)
-            #     score[i, erase_idx] = score.min()
+            num_erase = score.shape[1] - num_target.max() - opt.neg_num
+            erase_prob = torch.max(torch.tensor(0.), 1. - target)
+            erase_idx = torch.multinomial(erase_prob, num_erase)
+            sample_score = torch.clone(score)
+            for i in range(score.shape[0]):
+                sample_score[i, erase_idx[i, :]] = score[i, :].min()
             _, top_item = torch.topk(score, max(ats), -1)
+            _, sample_top_item = torch.topk(sample_score, max(ats), -1)
             top_items.append(top_item)
+            sample_top_items.append(sample_top_item)
             num_targets.append(num_target)
             labels.append(label)
             if iter % 200 == 0:
@@ -293,8 +304,13 @@ for epoch in range(opt.epoch):
             #torch.cuda.empty_cache()
         label = torch.cat(labels, 0)
         top_item = torch.cat(top_items, 0)
+        sample_top_item = torch.cat(sample_top_items, 0)
         num_target = torch.cat(num_targets, 0)
-        results = eval_metric(top_item, label, num_target, ats)
+        for name, top in zip(["true", "sampling"], [top_item, sample_top_item]):
+            results = eval_metric(top, label, num_target, ats)
+            results_str = '\n\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
+            print(f"{name} results:\n\t" + results_str, flush=True)
+        print('Epoch {}'.format(epoch + 1), '=============================================')
     for metric_name, val in results.items():
         if metric_name not in best or val > best[metric_name][0]:
             stop = metric_name not in best   # stop=False when val exceeds best_result
@@ -306,9 +322,7 @@ for epoch in range(opt.epoch):
         stop_num += 1
     else:
         stop_num = 0
-    results_str = '\n'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
-    print(results_str, flush=True)
-    print('Epoch {}'.format(epoch + 1), '=============================================')
+    
     ###############################################################
 results_str = '\n\t'.join([f"{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best.items()])
 print(f"\t{results_str}")
