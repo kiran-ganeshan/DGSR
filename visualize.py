@@ -1,0 +1,106 @@
+import torch, dgl, pickle, pandas as pd
+from collections import OrderedDict
+from DGNN import DGNN
+from IPython.display import display
+from utils import subsample, get_topk_items, multihot
+
+fake_user = False
+
+# data
+max_lookback = 12
+test_num = 4
+data_id = f"Enrollments_{test_num}_{max_lookback}_False"
+run_id = ''
+name = None
+old_run = False
+
+# model
+margin = False
+sampling = True
+multiplier = 1
+hypers = OrderedDict([
+	('bs', 25),
+	('lr', 0.001),
+	('ep', 30),
+	('l2', 0.0001),
+	('pw', 1.0),
+	('ft', 0.0),
+	('at', 0.2),
+	('ln', 3),
+	('hs', 50),
+	('mu', 25),
+	('mi', 25),
+	('k', 3)
+])
+
+# eval
+ats = [5, 10, 20]
+neg_num = 100
+
+# retrieve model state
+if old_run:
+    data_id = 'old_runs'
+    run_id = name
+else:
+    suffix = '_'.join([f'{key}{val}' for key, val in hypers.items()])
+    suffix = suffix + '_' + ('margin' if margin else 'bce')
+    if not run_id:
+        run_id = suffix
+    else:
+        run_id = run_id + '_' + suffix
+state = torch.load(f"static/{data_id}/{run_id}/model")
+with open(f"static/{data_id}/meta", 'rb') as f:
+    meta = pickle.load(f)
+    user_num = meta['user_num']
+    item_num = meta['item_num']
+    etypes = meta['etypes']
+    
+# load model and graphs
+model = DGNN(etypes, user_num, item_num, hypers['hs'], max_lookback, hypers['ft'], hypers['at'], hypers['ln'])
+model.load_state_dict(state)
+graphs, labels = dgl.load_graphs(f"static/{data_id}/test/23.bin")
+graph = graphs[0]
+
+# collate
+if fake_user:
+    graph.add_nodes(1, ntype='user')
+    user = torch.tensor([graph.num_nodes('user') - 1])
+    predict_time = torch.tensor([23])
+    past_items = torch.tensor([])
+    past_times = torch.tensor([])
+    edges = (user.repeat(len(past_items)), past_items)
+    e_data = {'time': past_times, 'predict_time': predict_time.repeat(len(past_items))}
+    graph.add_edges(edges, data=e_data, ntype='item')	
+else:
+    idx = torch.randint(labels['users'].shape[0], (1,))
+    user = labels['users'][idx]
+    label = labels['items'][idx, :]
+    num_target = labels['num_items'][idx]
+target = multihot(label, num_target, item_num)
+samples = [subsample(graph, user, hypers['mi'], hypers['mu'], hypers['k']) for _ in range(multiplier)]
+graph, u = zip(*samples)
+user = torch.cat(u).long()
+batch = dgl.batch(graph)
+
+# run model and get topk items
+
+user = user.cuda()
+device = torch.get_device(user)
+model = model.to(device)
+batch = batch.to(device)
+target = target.cuda()
+num_taret = num_target.cuda()
+with torch.no_grad():
+	score = model(batch, user)
+	score = score.reshape(-1, multiplier, item_num).mean(1)
+	top, sample_top = get_topk_items(score, target, num_target, max(ats), neg_num)
+	top = top.squeeze().cpu()
+	sample_top = sample_top.squeeze().cpu()
+
+# get item descriptions
+cid_desc = pd.read_csv('data/ucb_raw_data/courses.csv')
+abbr_desc = pd.read_csv('data/ucb_raw_data/course_catalog_description.tsv', sep='\t')
+courses = cid_desc.merge(abbr_desc, left_on='course desc', right_on='course_description', how='left')
+courses = courses[['cid', 'abbr_cid', 'course_title', 'course desc']].sort_values('cid')
+display(courses[courses['cid'].isin(top.tolist())])
+display(courses[courses['cid'].isin(sample_top.tolist())])

@@ -16,7 +16,7 @@ from torch.nn.functional import one_hot
 from bisect import bisect
 
 class StaticData(Dataset):
-    def __init__(self, root_dir):
+    def __init__(self, root_dir, sampling=False, user_batching=1):
         self.root = root_dir
         def load_data(data_path):
             data_dir = []
@@ -27,17 +27,27 @@ class StaticData(Dataset):
             return data_dir
         dir_list = load_data(root_dir)
         self.graph_list = [dgl.load_graphs(dir_) for dir_ in dir_list]
-        self.user_list = [labels['users'].shape[0] for _, labels in self.graph_list]
-        self.user_list = np.cumsum(self.user_list)
-        self.past_user_list = np.roll(self.user_list, 1)
-        self.past_user_list[0] = 0
-        self.size = self.user_list[-1]
+        self.batch_list = [labels['users'].shape[0] for _, labels in self.graph_list]
+        self.num_users = np.sum(self.batch_list)
+        if not sampling:
+            self.batch_list = [x // user_batching + (x % user_batching > 0) for x in self.batch_list]
+        self.batch_list = np.cumsum(self.batch_list)
+        self.past_batch_list = np.roll(self.batch_list, 1)
+        self.past_batch_list[0] = 0
+        self.size = self.batch_list[-1]
+            
+        self.sampling = sampling
+        self.batch_size = user_batching
 
     def __getitem__(self, index):
-        list_idx = bisect(self.user_list, index)
+        list_idx = bisect(self.batch_list, index)
         graphs, labels = self.graph_list[list_idx]
-        past_users = self.past_user_list[list_idx]
-        labels = {key: val[index - past_users, ...].unsqueeze(0) for key, val in labels.items()}
+        past_users = self.past_batch_list[list_idx]
+        if self.sampling:
+            labels = {key: val[index - past_users, ...].unsqueeze(0) for key, val in labels.items()}
+        else:
+            idx = index - past_users
+            labels = {key: val[idx:idx + self.batch_size].unsqueeze(0) for key, val in labels.items()}
         return graphs[0], labels
 
     def __len__(self):
@@ -89,7 +99,7 @@ def empty_like(graph):
     num_nodes = {ntype: graph.num_nodes(ntype) for ntype in graph.ntypes}
     return dgl.heterograph(edge_lst, num_nodes)
 
-def subsample(graph, user, time, max_items, max_users, k):
+def subsample(graph, user, max_items, max_users, k):
     rev_etypes = {'by': 'pby', 'pby': 'by'}
     n_limit = {ntype: -1 for ntype in graph.ntypes}
     n_limit['user'] = max_users
@@ -123,30 +133,34 @@ def subsample(graph, user, time, max_items, max_users, k):
         for ntype in graph.ntypes:
             new_nodes[ntype] = torch.tensor(np.setdiff1d(new_nodes[ntype], nodes[ntype]))
             nodes[ntype] = torch.unique(torch.cat([new_nodes[ntype], nodes[ntype]]))
-    khop = dgl.edge_subgraph(graph, edges, relabel_nodes=False)
-    for etype in khop.etypes:
-        khop.edges[etype].data['predict_time'] = time.repeat(khop.num_edges(etype))
-    return khop
+    khop = dgl.edge_subgraph(graph, edges)
+    user = torch.where(user[:, None] == khop.nodes['user'].data[dgl.NID][None, :])[1]
+    return khop, user
     
     
 
 def get_collate(item_num, max_items, max_users, k_hop, 
-                train=True, margin=False, multiplier=1):
+                train=True, margin=False, sampling=False, multiplier=1):
     def collate(data):
-        # gather data
+        # gather data (and subsample graphs if necessary)
         user, graphs, label, num_target = [], [], [], []
         for graph, labels in data:
             u = labels['users'].long()
-            graph = [subsample(graph, u, labels['time'], max_items, max_users, k_hop) for _ in range(multiplier)]
+            if len(u.shape) > 1:
+                u = u.squeeze(-1)
+            if sampling:
+                samples = [subsample(graph, u, max_items, max_users, k_hop) for _ in range(multiplier)]
+                graph, u = zip(*samples)
+                u = torch.cat(u)
+            else:
+                graph = [graph]
             user.append(u)
             graphs.extend(graph)
             label.append(labels['items'])
             num_target.append(labels['num_items'])
         # batch and move to torch
-        # print([u.shape[0] for u in user])
         user = torch.cat(user).long()
         graphs = dgl.batch(graphs)
-        # print(graphs.batch_num_nodes('user'))
         label = torch.cat(label).long()
         num_target = torch.cat(num_target).long()
         # multihot-encode target and sample remaining users
@@ -154,12 +168,11 @@ def get_collate(item_num, max_items, max_users, k_hop,
             target = pad(label, item_num)
         else:
             target = multihot(label, num_target, item_num)
-        # generate negatives if required
-        # print(user.shape, target.shape)
-        if multiplier != 1:
+        # duplicate users/targets if using multiple graph samples
+        if sampling and multiplier != 1:
             user = user.repeat(multiplier)
             target = target.repeat(multiplier, 1)
-        # print(user.shape, target.shape)
+
         if not train:
             return graphs, user, target, label, num_target
         else:
@@ -171,12 +184,12 @@ def eval_metric(top, label, num_pos, ats=[5, 10, 20]):
     ndcgs = {at: ([], []) for at in ats}
     B, K = top.shape
     _, I = label.shape
-    top = top.unsqueeze(1)
-    label = label.unsqueeze(2)
-    ranks = torch.arange(K).cuda().unsqueeze(0).unsqueeze(0)
+    top = top[:, None, :]
+    label = label[:, :, None]
+    ranks = torch.arange(K)[None, None, :].cuda()
     cgs = 1. / torch.log2(ranks + 2)
     matches = (top == label)
-    mask = (torch.arange(I).cuda().unsqueeze(0) < num_pos.unsqueeze(1)).unsqueeze(-1)
+    mask = (torch.arange(K)[None, None, :].cuda() < num_pos[:, None, None])
     for at in ats:
         cg = cgs[:, :, :at]
         match = matches[:, :, :at]
@@ -194,3 +207,32 @@ def mkdir_if_not_exist(file_name):
     dir_name = os.path.dirname(file_name)
     if not os.path.isdir(dir_name):
         os.makedirs(dir_name)
+        
+def long_substr(data):
+    def is_substr(find, data):
+        if len(data) < 1 and len(find) < 1:
+            return False
+        for i in range(len(data)):
+            if find not in data[i]:
+                return False
+        return True
+    substr = ''
+    if len(data) > 1 and len(data[0]) > 0:
+        for i in range(len(data[0])):
+            for j in range(len(data[0])-i+1):
+                if j > len(substr) and is_substr(data[0][i:i+j], data):
+                    substr = data[0][i:i+j]
+    return substr
+
+def get_topk_items(score, target, num_target, k, neg_num=None):
+    _, top_item = torch.topk(score, k, -1)
+    if neg_num is None:
+        return top_item
+    num_erase = score.shape[1] - num_target.max() - neg_num
+    erase_prob = torch.max(torch.tensor(0.), 1. - target)
+    erase_idx = torch.multinomial(erase_prob, num_erase)
+    sample_score = torch.clone(score)
+    for i in range(score.shape[0]):
+        sample_score[i, erase_idx[i, :]] = score[i, :].min()
+    _, sample_top_item = torch.topk(sample_score, k, -1)
+    return top_item, sample_top_item

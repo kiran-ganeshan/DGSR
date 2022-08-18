@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 
 class DGNN(nn.Module):
+    
     def __init__(self, etypes, user_num, item_num, input_dim, max_lookback, feat_drop=0.2, 
                  attn_drop=0.2, layer_num=3):
         super(DGNN, self).__init__()
@@ -52,7 +53,8 @@ class Update(nn.Module):
         
     def forward(self, user_new, user_old):
         return F.tanh(self.rnn_weight(torch.cat([user_new, user_old], -1)))
-    
+
+
 class Reduce(nn.Module):
     
     def __init__(self, max_lookback, hidden_size, attn_drop):
@@ -78,12 +80,15 @@ class Reduce(nn.Module):
         key = self.key(src)
         val = self.value(src)
         e_ij = torch.sum((key_embed + key) * query, dim=2) / self.norm_const
+        # e_ij = torch.sum(key * query, dim=2) / self.norm_const
         alpha = self.atten_drop(F.softmax(e_ij, dim=1))
         if len(alpha.shape) == 2:
             alpha = alpha.unsqueeze(2)
         h_long = torch.sum(alpha * (val_embed + val), dim=1)
+        # h_long = torch.sum(alpha * val, dim=1)
         return {f'h': h_long}
-    
+
+
 class CrossReduce(nn.Module):
     
     def forward(self, nodes):
@@ -92,7 +97,9 @@ class CrossReduce(nn.Module):
             h = h.sum(-2)
         return {'h': h}
 
+
 class DGNNLayer(nn.Module):
+    
     def __init__(self, etypes, hidden_size, max_lookback, feat_drop=0.2, attn_drop=0.2):
         super(DGNNLayer, self).__init__()
         self.hidden_size = hidden_size
@@ -124,7 +131,7 @@ class DGNNLayer(nn.Module):
             g.nodes[ntype].data['h'] = self.update[ntype](g.nodes[ntype].data['h'], feat_dict[ntype])
         feat_dict = {ntype: g.nodes[ntype].data['h'] for ntype in g.ntypes}
         return feat_dict
-    
+
 
 def graph_user(bg, user_index, user_feats):
     b_user_size = bg.batch_num_nodes('user')
@@ -134,9 +141,9 @@ def graph_user(bg, user_index, user_feats):
     return user_feats[new_user_index]
 
 
-# def graph_item(bg, last_index, item_feats):
-#     b_item_size = bg.batch_num_nodes('item')
-#     tmp = torch.roll(torch.cumsum(b_item_size, 0), 1)
-#     tmp[0] = 0
-#     new_item_index = tmp + last_index
-#     return item_feats[new_item_index]
+def graph_item(bg, item_index, item_feats):
+    b_item_size = bg.batch_num_nodes('item')
+    tmp = torch.roll(torch.cumsum(b_item_size, 0), 1)
+    tmp[0] = 0
+    new_item_index = tmp + item_index
+    return item_feats[new_item_index]

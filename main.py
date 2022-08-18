@@ -20,7 +20,7 @@ import sys
 from torch.utils.data import DataLoader
 import torch.optim as optim
 import torch.nn as nn
-from utils import user_neg, eval_metric, mkdir_if_not_exist, get_collate
+from utils import user_neg, eval_metric, mkdir_if_not_exist, get_collate, get_topk_items
 from preprocess import generate_graph, save_graphs, generate_data, preprocess_data
 
 
@@ -29,11 +29,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--data', default='Enrollments', help='data name: sample')
 parser.add_argument('--load', type=str, default=None, help='past model to load (default: from scratch)')
 parser.add_argument('--batch_size', type=int, default=25, help='input batch size')
-parser.add_argument('--multiplier', type=int, default=1, help='Number of graph samples per bucket')
+parser.add_argument('--multiplier', type=int, default=1, help='Number of graph samples per bucket (only applies if --sampling)')
 parser.add_argument('--hidden_size', type=int, default=50, help='hidden state size')
 parser.add_argument("--test_num", type=int, default=4, help='Number of test times')
 parser.add_argument("--k_hop", type=int, default=3, help='Number of hops in preprocessing')
 parser.add_argument("--margin", action='store_true', default=False, help='Use multilabel margin loss')
+parser.add_argument("--sampling", action='store_true', default=False, help='Whether to subsample input graphs')
 parser.add_argument("--pos_weight", type=float, default=1.0, help='Weighting on positive examples')
 parser.add_argument("--max_users", type=int, default=25, help='Maximum number of sampled users per hop')
 parser.add_argument("--max_items", type=int, default=25, help='Maximum number of sampled items per hop')
@@ -106,8 +107,8 @@ def preprocess():
         
     # data
     print('start data generation:', datetime.datetime.now(), flush=True)
-    train_num, val_num, test_num = generate_data(data, graph, opt.max_lookback, train_path, test_path, val_path, 
-                                                 opt.test_num, opt.k_hop)
+    path_args = (train_path, test_path, val_path)
+    train_num, val_num, test_num = generate_data(data, graph, opt.max_lookback, *path_args, opt.test_num)
     
     # save metadata (last to indicate completion)
     with open(metadata_path, 'wb') as file:
@@ -127,12 +128,12 @@ with open(metadata_path, 'rb') as file:
     item_num = metadata['item_num']
     etypes = metadata['etypes']
 
-train_set = StaticData(train_path)
-test_set = StaticData(test_path)
+train_set = StaticData(train_path, opt.sampling, opt.multiplier)
+test_set = StaticData(test_path, opt.sampling, opt.multiplier)
 if opt.val:
-    val_set = StaticData(val_path)
+    val_set = StaticData(val_path, opt.sampling, opt.multiplier)
 
-batch_size = opt.batch_size // opt.multiplier
+batch_size = opt.batch_size // (opt.multiplier if opt.sampling else 1)
 find_num_batches = lambda size: size // batch_size + (size % batch_size > 0)
 print('device: ', device)
 print('train number: ', find_num_batches(train_set.size))
@@ -142,9 +143,9 @@ print('item number: ', item_num)
 with open(neg_path, 'rb') as f:
     data_neg = pickle.load(f) # negatives for evaluation
 collate = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, True,
-                      opt.margin, opt.multiplier)
+                      opt.margin, opt.sampling, opt.multiplier)
 collate_test = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, False,
-                           opt.margin, opt.multiplier)
+                           opt.margin, opt.sampling, opt.multiplier)
 train_data = DataLoader(dataset=train_set, 
                         batch_size=batch_size, 
                         collate_fn=collate, 
@@ -239,16 +240,9 @@ for epoch in range(opt.epoch):
                 loss = loss_func(score, target)
                 val_loss += loss.detach().cpu().item()
                 score = score.reshape(-1, opt.multiplier, item_num).mean(1)
-                num_erase = score.shape[1] - num_target.max() - opt.neg_num
-                erase_prob = torch.max(torch.tensor(0.), 1. - target)
-                erase_idx = torch.multinomial(erase_prob, num_erase)
-                sample_score = torch.clone(score)
-                for i in range(score.shape[0]):
-                    sample_score[i, erase_idx[i, :]] = score[i, :].min()
-                _, top_item = torch.topk(score, max(ats), -1)
-                _, sample_top_item = torch.topk(sample_score, max(ats), -1)
-                top_items.append(top_item)
-                sample_top_items.append(sample_top_item)
+                top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
+                top_items.append(top)
+                sample_top_items.append(sample_top)
                 num_targets.append(num_target)
                 labels.append(label)
                 if iter % (test_set.size // 1000) == 0:
@@ -284,16 +278,9 @@ for epoch in range(opt.epoch):
             loss = loss_func(score, target)
             test_loss += loss.detach().cpu().item()
             score = score.reshape(-1, opt.multiplier, item_num).mean(1)
-            num_erase = score.shape[1] - num_target.max() - opt.neg_num
-            erase_prob = torch.max(torch.tensor(0.), 1. - target)
-            erase_idx = torch.multinomial(erase_prob, num_erase)
-            sample_score = torch.clone(score)
-            for i in range(score.shape[0]):
-                sample_score[i, erase_idx[i, :]] = score[i, :].min()
-            _, top_item = torch.topk(score, max(ats), -1)
-            _, sample_top_item = torch.topk(sample_score, max(ats), -1)
-            top_items.append(top_item)
-            sample_top_items.append(sample_top_item)
+            top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
+            top_items.append(top)
+            sample_top_items.append(sample_top)
             num_targets.append(num_target)
             labels.append(label)
             if iter % 200 == 0:
@@ -324,6 +311,9 @@ for epoch in range(opt.epoch):
         stop_num = 0
     
     ###############################################################
+    print(f"max memory allocated: {torch.cuda.max_memory_allocated()}")
+    print(f"max memory reserved: {torch.cuda.max_memory_reserved()}")
+    print(f"max memory cached: {torch.cuda.max_memory_cached()}")
 results_str = '\n\t'.join([f"{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best.items()])
 print(f"\t{results_str}")
 sys.stdout.close()

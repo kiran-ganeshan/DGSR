@@ -41,7 +41,9 @@ def generate_graph(data):
     graph.nodes['item'].data['item_id'] = torch.tensor(np.unique(item)).long()
     return graph
 
-def generate(data, graph, max_lookback, t_cutoff, train_path, test_path, val_path):
+def generate_data(data, graph, max_lookback, train_path, test_path, val_path, test_num):
+    times = np.sort(np.unique(data['time'].values))
+    t_cutoff = times[-test_num - 1]
     train_num, test_num, val_num = 0, 0, 0
     data = data.rename(columns={'user_id': 'users', 'item_id': 'items'})
     data = data.groupby(['time', 'users'])
@@ -67,11 +69,14 @@ def generate(data, graph, max_lookback, t_cutoff, train_path, test_path, val_pat
         edges = {key: (graph.edges[key].data['time'] < t) & 
                       (graph.edges[key].data['time'] >= t - max_lookback) 
                       for key in graph.etypes}
-        subgraph = dgl.edge_subgraph(graph, edges, relabel_nodes=False)
+        subgraph = dgl.edge_subgraph(graph, edges)
+        for etype in subgraph.etypes:
+            subgraph.edges[etype].data['predict_time'] = torch.tensor([t]).repeat(subgraph.num_edges(etype))
         rel_path = '/' + str(t) + '.bin'
         keys = ['items', 'users', 'num_items']
         labels = {key: torch.tensor(row[key]).long() for key in keys}
-        labels = {**labels, 'time': torch.tensor([t]).long().repeat(labels['users'].shape[0])}
+        alias_match = (labels['users'][:, None] == subgraph.nodes['user'].data[dgl.NID][None, :])
+        labels['users'] = torch.where(alias_match)[1].squeeze()
         if t == t_cutoff and val_path is not None:
             dgl.save_graphs(val_path + rel_path, subgraph, labels)
             val_num += 1
@@ -82,80 +87,6 @@ def generate(data, graph, max_lookback, t_cutoff, train_path, test_path, val_pat
             dgl.save_graphs(test_path + rel_path, subgraph, labels)
             test_num += 1
     return train_num, val_num, test_num
-    
-
-
-def generate_user(user, data, graph, max_lookback, t_cutoff, 
-                  train_path, test_path, val_path, k_hop):
-    data = data[data['user_id'] == user].sort_values('time')
-    u_time = data['time'].values
-    u_seq = data['item_id'].values
-    
-    # basket-ize same-time items
-    prev_time = -1
-    basket_time = np.unique(u_time)       # basket-ized times
-    u_basket_seq = []                       # basket-ized items
-    for time, item in zip(u_time, u_seq):
-        if time != prev_time:
-            u_basket_seq.append([])
-            prev_time = time
-        u_basket_seq[-1].append(item)
-    
-    train_num, val_num, test_num = 0, 0, 0
-    if len(u_seq) < 2:                      # if not enough data for a training 
-        return train_num, val_num, test_num # example, ignore this user
-    for t, target in zip(basket_time[1:], u_basket_seq[1:]):
-        # remove future edges and past edges older than max_lookback
-        edges = {key: (graph.edges[key].data['time'] < t) & 
-                      (graph.edges[key].data['time'] >= t - max_lookback) 
-                      for key in graph.etypes}
-        subgraph = dgl.edge_subgraph(graph, edges, relabel_nodes=False)
-        
-        # extract k-hop subgraph
-        prev_num_nodes, num_nodes = 0, 1
-        edges = {etype: [] for etype in subgraph.etypes}
-        nodes = {ntype: torch.tensor([]).long() for ntype in subgraph.ntypes}
-        nodes['user'] = torch.tensor([user]).long()
-        new_nodes = nodes.copy()
-        hop = 0
-        while (k_hop < 0 or hop < k_hop) and num_nodes > prev_num_nodes:    # get nodes in k-hop subgraph
-            prev_num_nodes = num_nodes
-            for srctype, etype, dsttype in subgraph.canonical_etypes:
-                for intype, outtype in [(srctype, dsttype), (dsttype, srctype)]:
-                    func = subgraph.successors if intype == srctype else subgraph.predecessors
-                    new_nodes[outtype] = [new_nodes[outtype]] + [func(i, etype) for i in nodes[intype]]
-                    new_nodes[outtype] = torch.unique(torch.cat(new_nodes[outtype]))
-            nodes = new_nodes.copy()
-            num_nodes = sum([len(nodelst) for nodelst in nodes.values()])
-            hop += 1
-        for srctype, etype, dsttype in subgraph.canonical_etypes:              # get edges between nodes
-            for src, dst, eid in zip(*[x.tolist() for x in subgraph.edges('all', etype=etype)]):
-                if src in nodes[srctype] and dst in nodes[dsttype]:
-                    edges[etype].append(eid)
-        subgraph = dgl.edge_subgraph(subgraph, edges, relabel_nodes=False)
-        
-        # save graphs
-        rel_path = '/' + str(user) + '_' + str(t) + '.bin'
-        labels = {'items': [target], 'users': [user], 'num_items': [len(target)], 'num_users': 1}
-        labels = {key: torch.tensor([val]).long() for key, val in labels.items()}
-        labels = {**labels, 'time': torch.tensor([t]).long()}
-        if t == t_cutoff and val_path is not None:
-            save_graphs(val_path + rel_path, subgraph, labels)
-            val_num += 1
-        elif t <= t_cutoff:
-            save_graphs(train_path + rel_path, subgraph, labels)
-            train_num += 1
-        else:
-            save_graphs(test_path + rel_path, subgraph, labels)
-            test_num += 1
-    return train_num, val_num, test_num
-
-
-def generate_data(data, graph, max_lookback, train_path, test_path, val_path, test_num, k_hop):
-    times = np.sort(np.unique(data['time'].values))
-    t_cutoff = times[-test_num - 1]
-    return generate(data, graph, max_lookback, 
-                    t_cutoff, train_path, test_path, val_path)
     
 
 
