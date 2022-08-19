@@ -12,7 +12,7 @@ import numpy as np
 from DGNN import DGNN
 import dgl
 import pickle
-from utils import StaticData
+from utils import SamplingGraphData, GraphData
 import warnings
 import argparse
 import os
@@ -45,7 +45,7 @@ parser.add_argument('--feat_drop', type=float, default=0.0, help='drop_out')
 parser.add_argument('--attn_drop', type=float, default=0.2, help='drop_out')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
 parser.add_argument('--neg_num', type=int, default=100, help='Number of negatives to sample')
-parser.add_argument('--max_lookback', type=int, default=25, help='maximum lookback in original time')
+parser.add_argument('--max_lookback', type=int, default=12, help='maximum lookback in original time')
 parser.add_argument('--gpu', default='2')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--nosave", action='store_true', default=False, help='model and outputs not saved')
@@ -60,7 +60,9 @@ print(f"opt: {opt}")
 
 # loading data (and preprocessing if necessary)
 data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.val}"
-run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_l2{opt.l2}_pw{opt.pos_weight}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
+run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_l2{opt.l2}_pw{opt.pos_weight}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}"
+if opt.sampling:
+    run_id = run_id + f"_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
 run_id += '_' + ('margin' if opt.margin else 'bce')
 if opt.run_id:
     run_id = opt.run_id + '_' + run_id
@@ -128,10 +130,11 @@ with open(metadata_path, 'rb') as file:
     item_num = metadata['item_num']
     etypes = metadata['etypes']
 
-train_set = StaticData(train_path, opt.sampling, opt.multiplier)
-test_set = StaticData(test_path, opt.sampling, opt.multiplier)
+Dataset = SamplingGraphData if opt.sampling else GraphData
+train_set = Dataset(train_path)
+test_set = Dataset(test_path)
 if opt.val:
-    val_set = StaticData(val_path, opt.sampling, opt.multiplier)
+    val_set = Dataset(val_path)
 
 batch_size = opt.batch_size // (opt.multiplier if opt.sampling else 1)
 find_num_batches = lambda size: size // batch_size + (size % batch_size > 0)
@@ -198,15 +201,13 @@ for epoch in range(opt.epoch):
     print('start training: ', curr_time)
     epoch_start = curr_time
     model.train()
-    for batch_graph, user, target in train_data:
-        # print(user.shape, target.shape)
+    for batch_graph, user, batch_idx, target in train_data:
+        #print(user.shape, target.shape, batch_idx.shape, flush=True)
         iter += 1
         batch_graph = batch_graph.to(device)
         user = user.cuda()
         target = target.cuda()
-        score = model(batch_graph, user)
-        # if opt.margin:
-        #     score = torch.sigmoid(score)
+        score = model(batch_graph, user, batch_idx)
         loss = loss_func(score, target)
         optimizer.zero_grad()
         loss.backward()
@@ -229,14 +230,14 @@ for epoch in range(opt.epoch):
         top_items, sample_top_items, num_targets, labels = [], [], [], []
         ats = [5, 10, 20]
         with torch.no_grad:
-            for batch_graph, user, target, label, num_target in val_data:
+            for batch_graph, user, batch_idx, target, label, num_target in val_data:
                 iter += 1
                 batch_graph = batch_graph.to(device)
                 user = user.cuda()
                 target = target.cuda()
                 label = label.cuda()
                 num_target = num_target.cuda()
-                score = model(batch_graph, user)
+                score = model(batch_graph, user, batch_idx)
                 loss = loss_func(score, target)
                 val_loss += loss.detach().cpu().item()
                 score = score.reshape(-1, opt.multiplier, item_num).mean(1)
@@ -267,14 +268,14 @@ for epoch in range(opt.epoch):
     iter = 0
     ats = [5, 10, 20]
     with torch.no_grad():
-        for batch_graph, user, target, label, num_target in test_data:
+        for batch_graph, user, batch_idx, target, label, num_target in test_data:
             iter += 1
             batch_graph = batch_graph.to(device)
             user = user.cuda()
             label = label.cuda()
             target = target.cuda()
             num_target = num_target.cuda()
-            score = model(batch_graph, user)
+            score = model(batch_graph, user, batch_idx)
             loss = loss_func(score, target)
             test_loss += loss.detach().cpu().item()
             score = score.reshape(-1, opt.multiplier, item_num).mean(1)
@@ -311,9 +312,9 @@ for epoch in range(opt.epoch):
         stop_num = 0
     
     ###############################################################
-    print(f"max memory allocated: {torch.cuda.max_memory_allocated()}")
-    print(f"max memory reserved: {torch.cuda.max_memory_reserved()}")
-    print(f"max memory cached: {torch.cuda.max_memory_cached()}")
+    print(f"max memory allocated: {torch.cuda.max_memory_allocated() / 1e9:.4f}")
+    print(f"max memory reserved: {torch.cuda.max_memory_reserved() / 1e9:.4f}")
+    print(f"max memory cached: {torch.cuda.max_memory_cached() / 1e9:.4f}")
 results_str = '\n\t'.join([f"{metric_name} at {epoch}: {val:.4f}" for metric_name, (val, epoch) in best.items()])
 print(f"\t{results_str}")
 sys.stdout.close()

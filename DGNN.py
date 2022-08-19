@@ -21,7 +21,7 @@ class DGNN(nn.Module):
                                      for _ in range(self.layer_num)])
         self.reset_parameters()
 
-    def forward(self, g, user):
+    def forward(self, g, user, idx):
         feat_dict = None
         user_layer = []
         g.nodes['user'].data['user_h'] = self.user_embedding(g.nodes['user'].data['user_id'].cuda())
@@ -29,18 +29,15 @@ class DGNN(nn.Module):
         if self.layer_num > 0:
             for conv in self.layers:
                 feat_dict = conv(g, feat_dict)
-                user_layer.append(graph_user(g, user, feat_dict['user']))
+                user_layer.append(get_feat(g, user, idx, feat_dict, 'user'))
         unified_embedding = self.unified_map(torch.cat(user_layer, -1))
-        score = torch.matmul(unified_embedding, self.item_embedding.weight.transpose(1, 0))
+        norm_item_embed = self.item_embedding.weight #/ torch.norm(self.item_embedding.weight, dim=-1)[..., None]
+        score = torch.matmul(unified_embedding, norm_item_embed.transpose(1, 0))
         return score
 
     def reset_parameters(self):
         gain = nn.init.calculate_gain('relu')
-        for name, weight in self.named_parameters():
-            # if name != 'unified_map.weight' and len(weight.shape) > 1:
-            #     nn.init.xavier_normal_(weight, gain=gain)
-            # elif len(weight.shape) > 1:
-            #     nn.init.zeros_(weight)
+        for weight in self.parameters():
             if weight.dim() > 1:
                 nn.init.xavier_normal_(weight, gain=gain)
 
@@ -133,17 +130,9 @@ class DGNNLayer(nn.Module):
         return feat_dict
 
 
-def graph_user(bg, user_index, user_feats):
-    b_user_size = bg.batch_num_nodes('user')
-    tmp = torch.roll(torch.cumsum(b_user_size, 0), 1)
+def get_feat(bg, idx, batch_idx, feat_dict, ntype):
+    num_nodes = bg.batch_num_nodes(ntype)
+    tmp = torch.roll(torch.cumsum(num_nodes, 0), 1)
     tmp[0] = 0
-    new_user_index = tmp + user_index
-    return user_feats[new_user_index]
-
-
-def graph_item(bg, item_index, item_feats):
-    b_item_size = bg.batch_num_nodes('item')
-    tmp = torch.roll(torch.cumsum(b_item_size, 0), 1)
-    tmp[0] = 0
-    new_item_index = tmp + item_index
-    return item_feats[new_item_index]
+    new_user_idx = tmp[batch_idx] + idx
+    return feat_dict[ntype][new_user_idx]

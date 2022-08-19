@@ -1,4 +1,4 @@
-import torch, dgl, pickle, pandas as pd
+import torch, dgl, pickle, pandas as pd, numpy as np
 from collections import OrderedDict
 from DGNN import DGNN
 from IPython.display import display
@@ -90,10 +90,14 @@ model = model.to(device)
 batch = batch.to(device)
 target = target.cuda()
 num_taret = num_target.cuda()
+all_sample_top = {}
 with torch.no_grad():
 	score = model(batch, user)
 	score = score.reshape(-1, multiplier, item_num).mean(1)
 	top, sample_top = get_topk_items(score, target, num_target, max(ats), neg_num)
+	for n in range(100, 1000, 100):
+		_, s = get_topk_items(score, target, num_target, max(ats), n)
+		all_sample_top[n] = s.squeeze().cpu()
 	top = top.squeeze().cpu()
 	sample_top = sample_top.squeeze().cpu()
 
@@ -102,5 +106,22 @@ cid_desc = pd.read_csv('data/ucb_raw_data/courses.csv')
 abbr_desc = pd.read_csv('data/ucb_raw_data/course_catalog_description.tsv', sep='\t')
 courses = cid_desc.merge(abbr_desc, left_on='course desc', right_on='course_description', how='left')
 courses = courses[['cid', 'abbr_cid', 'course_title', 'course desc']].sort_values('cid')
-display(courses[courses['cid'].isin(top.tolist())])
-display(courses[courses['cid'].isin(sample_top.tolist())])
+def reorder(courses, top):
+    courses = courses.copy()
+    top = top.cpu().numpy()
+    courses = courses[courses['cid'].isin(top.tolist())]
+    matrix = (courses['cid'].values[:, None] == top[None, :])
+    ranks = np.arange(0, len(top))[None, :]
+    courses['idx'] = np.argmin((1. - matrix) * len(top) + ranks, -1)
+    return courses.sort_values('idx').drop(columns='idx')
+if not fake_user:
+    print("positive samples")
+    display(courses[courses['cid'].isin(label.tolist()[0])])
+print("\n\nall samples")
+display(reorder(courses, top))
+# print("100 samples")
+# display(courses[courses['cid'].isin(sample_top.tolist())])
+for key, t in all_sample_top.items():
+    print(f"\n\n{key} samples")
+    display(reorder(courses, t))
+#print(plt.hist(torch.norm(model.item_embedding.weight, dim=-1).tolist()))
