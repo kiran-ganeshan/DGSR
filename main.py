@@ -18,6 +18,8 @@ import argparse
 import os
 import sys
 from torch.utils.data import DataLoader
+from torch.distributed.pipeline.sync import Pipe
+from torch.distributed import rpc
 import torch.optim as optim
 import torch.nn as nn
 from utils import user_neg, eval_metric, mkdir_if_not_exist, get_collate, get_topk_items
@@ -28,13 +30,14 @@ warnings.filterwarnings('ignore')
 parser = argparse.ArgumentParser()
 parser.add_argument('--data', default='Enrollments', help='data name: sample')
 parser.add_argument('--load', type=str, default=None, help='past model to load (default: from scratch)')
-parser.add_argument('--batch_size', type=int, default=25, help='input batch size')
+parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
 parser.add_argument('--multiplier', type=int, default=1, help='Number of graph samples per bucket (only applies if --sampling)')
 parser.add_argument('--hidden_size', type=int, default=50, help='hidden state size')
 parser.add_argument("--test_num", type=int, default=4, help='Number of test times')
 parser.add_argument("--k_hop", type=int, default=3, help='Number of hops in preprocessing')
 parser.add_argument("--margin", action='store_true', default=False, help='Use multilabel margin loss')
 parser.add_argument("--sampling", action='store_true', default=False, help='Whether to subsample input graphs')
+parser.add_argument("--use_item_feat", action='store_true', default=False, help='Whether to use the item input embedding to calculate scores')
 parser.add_argument("--pos_weight", type=float, default=1.0, help='Weighting on positive examples')
 parser.add_argument("--max_users", type=int, default=25, help='Maximum number of sampled users per hop')
 parser.add_argument("--max_items", type=int, default=25, help='Maximum number of sampled items per hop')
@@ -50,20 +53,29 @@ parser.add_argument('--gpu', default='2')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--nosave", action='store_true', default=False, help='model and outputs not saved')
 parser.add_argument("--run_id", type=str, default='', help='Additional identifier for run (outside of hparams)')
+parser.add_argument("--port", type=str, default='29500', help='RPC Port')
 
 opt = parser.parse_args()
 args, extras = parser.parse_known_args()
-device = torch.device(f'cuda:{opt.gpu}')
-torch.cuda.set_device(device)
-print(f"device: {device}")
+devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]     # get available devices
+if len(devices) > opt.layer_num + 2:                                                # use at most layer_num + 2 devices
+    devices = devices[:opt.layer_num + 2]
+device = devices[-1]                                                                # device to embed and predict on
+devices = devices[:-1]                                                              # devices to compute graph layers on
+torch.cuda.set_device(device)                                                       # redirect .cuda() to correct device
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = opt.port
+rpc.init_rpc('worker', rank=0, world_size=1)
+print(f"devices: {devices}")
 print(f"opt: {opt}")
 
 # loading data (and preprocessing if necessary)
 data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.val}"
 run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_l2{opt.l2}_pw{opt.pos_weight}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}"
 if opt.sampling:
-    run_id = run_id + f"_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
+    run_id += f"_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
 run_id += '_' + ('margin' if opt.margin else 'bce')
+run_id += '_' + ('feat' if opt.use_item_feat else 'embed')
 if opt.run_id:
     run_id = opt.run_id + '_' + run_id
 data_path = 'static/' + data_id + '/'
@@ -138,9 +150,13 @@ if opt.val:
 
 batch_size = opt.batch_size // (opt.multiplier if opt.sampling else 1)
 find_num_batches = lambda size: size // batch_size + (size % batch_size > 0)
-print('device: ', device)
-print('train number: ', find_num_batches(train_set.size))
-print('test number: ', find_num_batches(test_set.size))
+find_log_freq = lambda n, k: 1 if n < k else 2 * find_log_freq(n / 2, k)     # log freq so that we log at least k/2 and at most k times
+train_num = find_num_batches(train_set.size)
+test_num = find_num_batches(test_set.size)
+train_log_freq = find_log_freq(train_num, 20)
+test_log_freq = find_log_freq(test_num, 10)
+print('train number: ', train_num)
+print('test number: ', test_num)
 print('user number: ', user_num)
 print('item number: ', item_num)
 with open(neg_path, 'rb') as f:
@@ -169,10 +185,9 @@ if opt.val:
                           num_workers=2)
 
 # initialize the model
-model = DGNN(etypes=etypes, user_num=user_num, item_num=item_num, 
-             input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
-             feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, 
-             layer_num=opt.layer_num).cuda()
+args = (etypes, {'user': user_num, 'item': item_num}, opt.hidden_size, opt.max_lookback, 
+        device, devices, opt.feat_drop, opt.attn_drop, opt.layer_num, opt.use_item_feat)
+model = Pipe(DGNN(*args), min(opt.batch_size, 8), 'never')
 # model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
 #              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
 if opt.load:
@@ -202,23 +217,27 @@ for epoch in range(opt.epoch):
     epoch_start = curr_time
     model.train()
     for batch_graph, user, batch_idx, target in train_data:
-        #print(user.shape, target.shape, batch_idx.shape, flush=True)
         iter += 1
         batch_graph = batch_graph.to(device)
         user = user.cuda()
+        batch_idx = batch_idx.cuda()
         target = target.cuda()
-        score = model(batch_graph, user, batch_idx)
-        loss = loss_func(score, target)
+        if opt.use_item_feat:
+            score, item_idx = model(batch_graph, user, batch_idx).local_value()
+        else:
+            score = model(batch_graph, user, batch_idx).local_value()
+            item_idx = torch.arange(item_num, device=device)
+        loss = loss_func(score, target[:, item_idx])
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         epoch_loss += loss.detach().cpu().item()
-        if iter % 1000 == 0:
+        if iter % train_log_freq == 0:
             if not opt.nosave:
                 torch.save(score, results_path + f"score_{epoch}_{iter}")
             print('\tIter {}, loss {:.4f}'.format(iter, epoch_loss/iter), datetime.datetime.now(), flush=True)
-        #del batch_graph, user, target, loss, score
-        #torch.cuda.empty_cache()
+        del batch_graph, user, target, loss, score
+        torch.cuda.empty_cache()
     epoch_loss /= iter
     ###############################################################
 
@@ -234,14 +253,20 @@ for epoch in range(opt.epoch):
                 iter += 1
                 batch_graph = batch_graph.to(device)
                 user = user.cuda()
+                batch_idx = batch_idx.cuda()
                 target = target.cuda()
                 label = label.cuda()
                 num_target = num_target.cuda()
-                score = model(batch_graph, user, batch_idx)
+                if opt.use_item_feat:
+                    score, item_idx = model(batch_graph, user, batch_idx).local_value()
+                else:
+                    score = model(batch_graph, user, batch_idx).local_value()
+                    item_idx = torch.arange(item_num, device=device)
+                target = target[:, item_idx]
                 loss = loss_func(score, target)
                 val_loss += loss.detach().cpu().item()
-                score = score.reshape(-1, opt.multiplier, item_num).mean(1)
-                top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
+                # score = score.reshape(-1, opt.multiplier, item_num).mean(1)
+                top, sample_top = get_topk_items(score, item_idx, target, num_target, max(ats), opt.neg_num)
                 top_items.append(top)
                 sample_top_items.append(sample_top)
                 num_targets.append(num_target)
@@ -250,8 +275,8 @@ for epoch in range(opt.epoch):
                     print('\tIter {}'.format(iter), datetime.datetime.now(), flush=True)
                 if not opt.nosave:
                     torch.save(score, results_path + f"val_score_{epoch}_{iter}")
-                #del batch_graph, user, score, target, loss
-                #torch.cuda.empty_cache()
+                del batch_graph, user, score, target, loss
+                torch.cuda.empty_cache()
             label = torch.cat(labels, 0)
             top_item = torch.cat(top_items, 0)
             sample_top_item = torch.cat(sample_top_items, 0)
@@ -272,24 +297,30 @@ for epoch in range(opt.epoch):
             iter += 1
             batch_graph = batch_graph.to(device)
             user = user.cuda()
-            label = label.cuda()
+            batch_idx = batch_idx.cuda()
             target = target.cuda()
+            label = label.cuda()
             num_target = num_target.cuda()
-            score = model(batch_graph, user, batch_idx)
+            if opt.use_item_feat:
+                score, item_idx = model(batch_graph, user, batch_idx).local_value()
+            else:
+                score = model(batch_graph, user, batch_idx).local_value()
+                item_idx = torch.arange(item_num, device=device)
+            target = target[:, item_idx]
             loss = loss_func(score, target)
             test_loss += loss.detach().cpu().item()
-            score = score.reshape(-1, opt.multiplier, item_num).mean(1)
-            top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
+            # score = score.reshape(-1, opt.multiplier, item_num).mean(1)
+            top, sample_top = get_topk_items(score, item_idx, target, num_target, max(ats), opt.neg_num)
             top_items.append(top)
             sample_top_items.append(sample_top)
             num_targets.append(num_target)
             labels.append(label)
-            if iter % 200 == 0:
+            if iter % test_log_freq == 0:
                 if not opt.nosave:
                     torch.save(score, results_path + f"test_score_{epoch}_{iter}")
                 print('\tIter {}, test_loss {:.4f}'.format(iter, test_loss / iter), datetime.datetime.now(), flush=True)
-            #del batch_graph, user, target, score, loss
-            #torch.cuda.empty_cache()
+            del batch_graph, user, target, score, loss
+            torch.cuda.empty_cache()
         label = torch.cat(labels, 0)
         top_item = torch.cat(top_items, 0)
         sample_top_item = torch.cat(sample_top_items, 0)

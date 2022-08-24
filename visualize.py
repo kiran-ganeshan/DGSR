@@ -1,4 +1,6 @@
-import torch, dgl, pickle, pandas as pd, numpy as np
+import os, torch, dgl, pickle, pandas as pd, numpy as np
+from torch.distributed import rpc
+from torch.distributed.pipeline.sync.pipe import Pipe
 from collections import OrderedDict
 from DGNN import DGNN
 from IPython.display import display
@@ -16,10 +18,11 @@ old_run = False
 
 # model
 margin = False
-sampling = True
+sampling = False
+feat = False
 multiplier = 1
 hypers = OrderedDict([
-	('bs', 25),
+	('bs', 2),
 	('lr', 0.001),
 	('ep', 30),
 	('l2', 0.0001),
@@ -28,10 +31,12 @@ hypers = OrderedDict([
 	('at', 0.2),
 	('ln', 3),
 	('hs', 50),
-	('mu', 25),
-	('mi', 25),
-	('k', 3)
+	# ('mu', 25),
+	# ('mi', 25),
+	# ('k', 3)
 ])
+# if not sampling:
+#     hypers = hypers[:-3]
 
 # eval
 ats = [5, 10, 20]
@@ -48,6 +53,8 @@ else:
         run_id = suffix
     else:
         run_id = run_id + '_' + suffix
+    run_id = run_id + '_' + ('feat' if feat else 'embed')
+print(run_id)
 state = torch.load(f"static/{data_id}/{run_id}/model")
 with open(f"static/{data_id}/meta", 'rb') as f:
     meta = pickle.load(f)
@@ -56,7 +63,17 @@ with open(f"static/{data_id}/meta", 'rb') as f:
     etypes = meta['etypes']
     
 # load model and graphs
-model = DGNN(etypes, user_num, item_num, hypers['hs'], max_lookback, hypers['ft'], hypers['at'], hypers['ln'])
+devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]     # get available devices
+if len(devices) > hypers['ln'] + 2:                                                 # use at most layer_num + 2 devices
+    devices = devices[:hypers['ln'] + 2]
+device = devices[-1]                                                                # device to embed and predict on
+devices = devices[:-1]                                                              # devices to compute graph layers on
+torch.cuda.set_device(device)                                                       # redirect .cuda() to correct device
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '29600'
+rpc.init_rpc('worker', rank=0, world_size=1)
+args = (etypes, {'user': user_num, 'item': item_num}, hypers['hs'], max_lookback, device, devices, hypers['ft'], hypers['at'], hypers['ln'], feat)
+model = Pipe(DGNN(*args), 1, 'never')
 model.load_state_dict(state)
 graphs, labels = dgl.load_graphs(f"static/{data_id}/test/23.bin")
 graph = graphs[0]
@@ -77,26 +94,34 @@ else:
     label = labels['items'][idx, :]
     num_target = labels['num_items'][idx]
 target = multihot(label, num_target, item_num)
-samples = [subsample(graph, user, hypers['mi'], hypers['mu'], hypers['k']) for _ in range(multiplier)]
-graph, u = zip(*samples)
-user = torch.cat(u).long()
+if sampling:
+    samples = [subsample(graph, user, hypers['mi'], hypers['mu'], hypers['k']) for _ in range(multiplier)]
+    graph, u = zip(*samples)
+    user = torch.cat(u).long()
+else:
+    graph = [graph]
 batch = dgl.batch(graph)
 
 # run model and get topk items
 
 user = user.cuda()
+idx = torch.zeros((1,)).long().cuda()
 device = torch.get_device(user)
-model = model.to(device)
+# model = model.to(device)
 batch = batch.to(device)
 target = target.cuda()
 num_taret = num_target.cuda()
 all_sample_top = {}
 with torch.no_grad():
-	score = model(batch, user)
-	score = score.reshape(-1, multiplier, item_num).mean(1)
-	top, sample_top = get_topk_items(score, target, num_target, max(ats), neg_num)
+	if feat:
+		score, item_idx = model(batch, user, idx).local_value()
+	else:
+		score = model(batch, user, idx).local_value()
+		item_idx = torch.arange(item_num, device=device)
+	#score = score.reshape(-1, multiplier, item_num).mean(1)
+	top, sample_top = get_topk_items(score, item_idx, target, num_target, max(ats), neg_num)
 	for n in range(100, 1000, 100):
-		_, s = get_topk_items(score, target, num_target, max(ats), n)
+		_, s = get_topk_items(score, item_idx, target, num_target, max(ats), n)
 		all_sample_top[n] = s.squeeze().cpu()
 	top = top.squeeze().cpu()
 	sample_top = sample_top.squeeze().cpu()

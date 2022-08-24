@@ -26,13 +26,27 @@ def preprocess_data(data):
     data, i_reverse = order(data, 'item_id')
     return data, u_reverse, i_reverse
 
-def generate_graph(data):
+def add_edges(srcntype, dstntype, fwdetype, revetype, src, dst, graph_data={}):
+    return {**graph_data,
+            (srcntype, fwdetype, dstntype) : (torch.tensor(src), torch.tensor(dst)),
+            (dstntype, revetype, srcntype): (torch.tensor(dst), torch.tensor(src))}
+
+def generate_graph(data, prereq_data=None, major_data=None):
     user = data['user_id'].values
     item = data['item_id'].values
     time = data['time'].values
     
-    graph_data = {('item','by','user'):(torch.tensor(item), torch.tensor(user)),
-                  ('user','pby','item'):(torch.tensor(user), torch.tensor(item))}
+    graph_data = add_edges('user', 'item', 'uti', 'itu', user, item)
+    
+    
+    if prereq_data:
+        graph_data = add_edges('item', 'item', 'req', 'rby', data['item_id'], data['prereq_id'], graph_data)
+    if major_data:
+        student = data['user_id'].values
+        major = data['major_id'].values
+        dept = data['dept_id'].values
+        graph_data = add_edges('user', 'major', 'utm', 'mtu', student, major, graph_data)
+        graph_data = add_edges('major', 'dept', 'mtd', 'dtm', major, dept, graph_data)
     graph = dgl.heterograph(graph_data)
     graph.edges['by'].data['time'] = torch.tensor(time).long()
     graph.edges['pby'].data['time'] = torch.tensor(time).long()

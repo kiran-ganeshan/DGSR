@@ -50,11 +50,10 @@ class SamplingGraphData(GraphData):
         
     def __getitem__(self, index):
         list_idx = bisect(self.num_user_lst, index)
-        graphs = self.graph_lst[list_idx]
-        labels = self.label_lst[list_idx]
+        graph, labels = super(SamplingGraphData, self).__getitem__(list_idx)
         batch_idx = self.batch_idx_lst[list_idx]
         labels = {key: val[index - batch_idx, ...].unsqueeze(0) for key, val in labels.items()}
-        return graphs[0], labels
+        return graph, labels
     
     def __len__(self):
         return self.size
@@ -64,29 +63,6 @@ def user_neg(data, item_num):
     all_item = range(item_num)
     u_item = data.groupby('user_id')['item_id']
     return u_item.apply(lambda x: np.setdiff1d(all_item, x))
-
-def neg_generate(user, label, neg_num=100, data_neg=None, item_num=None):
-    if item_num:
-        neg_num = 0
-        label = pad(label, item_num)
-    label = label.numpy()   
-    B, T = label.shape                          # number of batches and max targets per batch
-    neg = np.zeros((B, neg_num), np.int32)
-    idx_flags = (label == -1) * np.arange(T, 0, -1)
-    first_neg = np.argmax(idx_flags, -1)        # first idx to be -1 along last dim
-    has_neg = np.max(label == -1, -1)           # whether there is a -1
-    for i, u in enumerate(user):
-        if item_num:
-            neg_choices = np.setdiff1d(np.arange(item_num), label[i, :first_neg[i]])
-        elif data_neg:
-            neg_choices = data_neg[u.item()]
-        neg[i] = np.random.choice(neg_choices, neg_num, replace=False)
-        if has_neg[i]:                          # replace any -1s in label with neg samples
-            idx = first_neg[i].item()
-            label[i, idx:] = np.random.choice(neg_choices, T - idx, replace=False)
-    all_label = torch.tensor(np.concatenate([label, neg], axis=-1)).long() 
-    first_neg = torch.tensor(first_neg)
-    return all_label, first_neg
 
 def multihot(label, num_target, item_num):
     T, _ = label.shape
@@ -213,7 +189,7 @@ def eval_metric(top, label, num_pos, ats=[5, 10, 20]):
     ndcgs = {f'ndcg@{at}': val.cpu().numpy().item() for at, val in ndcgs.items()}
     return {**recalls, **ndcgs}
 
-def get_topk_items(score, target, num_target, k, neg_num=None):
+def get_topk_items(score, item_idx, target, num_target, k, neg_num=None):
     _, top_item = torch.topk(score, k, -1)
     if neg_num is None:
         return top_item
@@ -224,7 +200,7 @@ def get_topk_items(score, target, num_target, k, neg_num=None):
     for i in range(score.shape[0]):
         sample_score[i, erase_idx[i, :]] = score[i, :].min()
     _, sample_top_item = torch.topk(sample_score, k, -1)
-    return top_item, sample_top_item
+    return item_idx[top_item], item_idx[sample_top_item]
 
 def mkdir_if_not_exist(file_name):
     dir_name = os.path.dirname(file_name)
