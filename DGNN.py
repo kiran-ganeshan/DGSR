@@ -4,59 +4,6 @@ import torch.nn.functional as F
 from torch.distributed.pipeline.sync.skip import skippable, pop, stash
 from torch.distributed.pipeline.sync.pipe import PipeSequential
 
-
-class Update(nn.Module):
-    
-    def __init__(self, hidden_size):
-        super(Update, self).__init__()
-        self.rnn_weight = nn.Linear(2 * hidden_size, hidden_size, bias=False)
-        
-    def forward(self, user_new, user_old):
-        return F.tanh(self.rnn_weight(torch.cat([user_new, user_old], -1)))
-
-
-class Reduce(nn.Module):
-    
-    def __init__(self, max_lookback, hidden_size, attn_drop):
-        super(Reduce, self).__init__()
-        self.key_embed = nn.Embedding(max_lookback, hidden_size)
-        self.val_embed = nn.Embedding(max_lookback, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-        self.atten_drop = nn.Dropout(attn_drop)
-        self.norm_const = torch.sqrt(torch.tensor(hidden_size).float())
-        self.max_lookback = max_lookback
-
-    def forward(self, nodes):
-        pred_time = nodes.mailbox['predict_time']
-        time = nodes.mailbox['time']
-        src = nodes.mailbox['h']
-        dst = nodes.mailbox['k']
-        re_order = pred_time - time - 1
-        key_embed = self.key_embed(re_order)
-        val_embed = self.val_embed(re_order)
-        query = self.query(dst)
-        key = self.key(src)
-        val = self.value(src)
-        e_ij = torch.sum((key_embed + key) * query, dim=2) / self.norm_const
-        # e_ij = torch.sum(key * query, dim=2) / self.norm_const
-        alpha = self.atten_drop(F.softmax(e_ij, dim=1))
-        if len(alpha.shape) == 2:
-            alpha = alpha.unsqueeze(2)
-        h_long = torch.sum(alpha * (val_embed + val), dim=1)
-        # h_long = torch.sum(alpha * val, dim=1)
-        return {f'h': h_long}
-
-
-class CrossReduce(nn.Module):
-    
-    def forward(self, nodes):
-        h = nodes.data['h']
-        if h.dim() > 2:
-            h = h.sum(-2)
-        return {'h': h}
-
 def get_feat(bg, user, batch_idx, ntype, key='h', data=None):
     if not data:
         data = bg.nodes[ntype].data[key]
@@ -74,7 +21,63 @@ def get_batch_mask(bg, user_batch_idx, device=None):
                                 for i, n in enumerate(bg.batch_num_nodes('item'))])
     return (user_batch_idx[:, None] == item_batch_idx[None, :]).to(dtype=torch.float)
 
-# @wrap_forward
+
+class Update(nn.Module):
+    
+    def __init__(self, hidden_size):
+        super(Update, self).__init__()
+        self.rnn_weight = nn.Linear(2 * hidden_size, hidden_size, bias=False)
+        
+    def forward(self, user_new, user_old):
+        return F.tanh(self.rnn_weight(torch.cat([user_new, user_old], -1)))
+
+
+class Reduce(nn.Module):
+    
+    def __init__(self, etype, max_lookback, hidden_size, attn_drop):
+        super(Reduce, self).__init__()
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        self.atten_drop = nn.Dropout(attn_drop)
+        self.norm_const = torch.sqrt(torch.tensor(hidden_size).float())
+        self.max_lookback = max_lookback
+        self.encode_time = (etype in ['sc', 'cs'])
+        if self.encode_time:
+            self.key_embed = nn.Embedding(max_lookback, hidden_size)
+            self.val_embed = nn.Embedding(max_lookback, hidden_size)
+
+    def forward(self, nodes):
+        src = nodes.mailbox['h']
+        dst = nodes.mailbox['k']
+        query = self.query(dst)
+        key = self.key(src)
+        val = self.value(src)
+        if self.encode_time:
+            pred_time = nodes.mailbox['predict_time']
+            time = nodes.mailbox['time']
+            re_order = pred_time - time - 1
+            key_embed = self.key_embed(re_order)
+            val_embed = self.val_embed(re_order)
+            key = key + key_embed
+            val = val + val_embed
+        e_ij = torch.sum(key * query, dim=2) / self.norm_const
+        alpha = self.atten_drop(F.softmax(e_ij, dim=1))
+        if len(alpha.shape) == 2:
+            alpha = alpha.unsqueeze(2)
+        h_long = torch.sum(alpha * val, dim=1)
+        return {f'h': h_long}
+
+
+class CrossReduce(nn.Module):
+    
+    def forward(self, nodes):
+        h = nodes.data['h']
+        if h.dim() > 2:
+            h = h.sum(-2)
+        return {'h': h}
+
+
 class DGNNEmbedding(nn.Module):
     
     def __init__(self, 
@@ -98,7 +101,7 @@ class DGNNEmbedding(nn.Module):
             yield stash('item_embed', self.embeds['item'].weight)
         return g, user, idx
         
-# @wrap_forward
+
 class DGNNPredictor(nn.Module):
     
     def __init__(self, 
@@ -140,7 +143,7 @@ class DGNNPredictor(nn.Module):
         else:
             return score
     
-# @wrap_forward
+
 class DGNNLayer(nn.Module):
     
     def __init__(self, idx, etypes, stack_ntypes, hidden_size, max_lookback, layer_num, devices, feat_drop=0.2, attn_drop=0.2):
@@ -153,7 +156,7 @@ class DGNNLayer(nn.Module):
         self.conv, self.reduce, self.update = {}, {}, {}
         for srctype, etype, dsttype in etypes:
             self.conv[srctype] = nn.Linear(hidden_size, hidden_size, bias=False)
-            self.reduce[etype] = Reduce(max_lookback, hidden_size, attn_drop)
+            self.reduce[etype] = Reduce(etype, max_lookback, hidden_size, attn_drop)
             self.update[dsttype] = Update(hidden_size)
         self.conv = nn.ModuleDict(self.conv)
         self.reduce = nn.ModuleDict(self.reduce)

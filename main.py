@@ -22,8 +22,8 @@ from torch.distributed.pipeline.sync import Pipe
 from torch.distributed import rpc
 import torch.optim as optim
 import torch.nn as nn
-from utils import user_neg, eval_metric, mkdir_if_not_exist, get_collate, get_topk_items
-from preprocess import generate_graph, save_graphs, generate_data, preprocess_data
+from utils import eval_metric, mkdir_if_not_exist, get_collate, get_topk_items
+from preprocess import preprocess
 
 
 warnings.filterwarnings('ignore')
@@ -49,7 +49,6 @@ parser.add_argument('--attn_drop', type=float, default=0.2, help='drop_out')
 parser.add_argument('--layer_num', type=int, default=3, help='GNN layer')
 parser.add_argument('--neg_num', type=int, default=100, help='Number of negatives to sample')
 parser.add_argument('--max_lookback', type=int, default=12, help='maximum lookback in original time')
-parser.add_argument('--gpu', default='2')
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--nosave", action='store_true', default=False, help='model and outputs not saved')
 parser.add_argument("--run_id", type=str, default='', help='Additional identifier for run (outside of hparams)')
@@ -79,12 +78,6 @@ run_id += '_' + ('feat' if opt.use_item_feat else 'embed')
 if opt.run_id:
     run_id = opt.run_id + '_' + run_id
 data_path = 'static/' + data_id + '/'
-train_path = data_path + 'train/'
-test_path = data_path + 'test/'
-val_path = data_path + 'val/' if opt.val else None
-graph_path = data_path + 'graph'
-metadata_path = data_path + 'meta'
-neg_path = data_path + 'neg'
 out_folder = 'results/' + data_id + '/'
 mkdir_if_not_exist(out_folder)
 out_file = out_folder + run_id + '.out'
@@ -92,56 +85,7 @@ results_path = data_path + run_id + '/'
 mkdir_if_not_exist(results_path)
 model_file = results_path + 'model'
 sys.stdout = open(out_file, 'w+')
-def preprocess():
-    print('start preprocessing:', datetime.datetime.now(), flush=True)
-    for path in [data_path, train_path, test_path, val_path]:
-        if path:
-            mkdir_if_not_exist(path)
-    data = pd.read_csv('./data/' + opt.data + '.csv')
-    
-    # refine user, item, and time indices
-    data, u_rev, i_rev = preprocess_data(data)
-    
-    # metadata
-    metadata = {key + '_num': len(data[key + '_id'].unique()) for key in ['user', 'item']}
-    metadata = {**metadata, 'user_rev': u_rev, 'item_rev': i_rev}
-    
-    # negative samples
-    data_neg = user_neg(data, metadata['item_num'])
-    with open(neg_path, 'wb') as file:
-        pickle.dump(data_neg, file)
-    
-    # graph
-    if not os.path.exists(graph_path):
-        graph = generate_graph(data)
-        save_graphs(graph_path, graph)
-    else:
-        graph = dgl.load_graphs(graph_path)[0][0]
-    metadata = {**metadata, 'etypes': graph.canonical_etypes}
-        
-    # data
-    print('start data generation:', datetime.datetime.now(), flush=True)
-    path_args = (train_path, test_path, val_path)
-    train_num, val_num, test_num = generate_data(data, graph, opt.max_lookback, *path_args, opt.test_num)
-    
-    # save metadata (last to indicate completion)
-    with open(metadata_path, 'wb') as file:
-        pickle.dump(metadata, file)
-        
-    print('The number of train set: ', train_num // opt.batch_size, flush=True)
-    print('The number of val set: ', val_num // opt.batch_size, flush=True)
-    print('The number of test set: ', test_num // opt.batch_size, flush=True)
-    print('End preprocessing: ', datetime.datetime.now(), flush=True)
-if not os.path.exists(metadata_path):
-    preprocess()
-else:
-    print("skipped preprocessing", flush=True)
-with open(metadata_path, 'rb') as file:
-    metadata = pickle.load(file)
-    user_num = metadata['user_num']
-    item_num = metadata['item_num']
-    etypes = metadata['etypes']
-
+train_path, test_path, val_path, user_num, item_num, etypes = preprocess(opt, data_path)
 Dataset = SamplingGraphData if opt.sampling else GraphData
 train_set = Dataset(train_path)
 test_set = Dataset(test_path)
@@ -159,8 +103,6 @@ print('train number: ', train_num)
 print('test number: ', test_num)
 print('user number: ', user_num)
 print('item number: ', item_num)
-with open(neg_path, 'rb') as f:
-    data_neg = pickle.load(f) # negatives for evaluation
 collate = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, True,
                       opt.margin, opt.sampling, opt.multiplier)
 collate_test = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, False,
@@ -233,8 +175,6 @@ for epoch in range(opt.epoch):
         optimizer.step()
         epoch_loss += loss.detach().cpu().item()
         if iter % train_log_freq == 0:
-            if not opt.nosave:
-                torch.save(score, results_path + f"score_{epoch}_{iter}")
             print('\tIter {}, loss {:.4f}'.format(iter, epoch_loss/iter), datetime.datetime.now(), flush=True)
         del batch_graph, user, target, loss, score
         torch.cuda.empty_cache()
@@ -273,8 +213,6 @@ for epoch in range(opt.epoch):
                 labels.append(label)
                 if iter % (test_set.size // 1000) == 0:
                     print('\tIter {}'.format(iter), datetime.datetime.now(), flush=True)
-                if not opt.nosave:
-                    torch.save(score, results_path + f"val_score_{epoch}_{iter}")
                 del batch_graph, user, score, target, loss
                 torch.cuda.empty_cache()
             label = torch.cat(labels, 0)
@@ -316,8 +254,6 @@ for epoch in range(opt.epoch):
             num_targets.append(num_target)
             labels.append(label)
             if iter % test_log_freq == 0:
-                if not opt.nosave:
-                    torch.save(score, results_path + f"test_score_{epoch}_{iter}")
                 print('\tIter {}, test_loss {:.4f}'.format(iter, test_loss / iter), datetime.datetime.now(), flush=True)
             del batch_graph, user, target, score, loss
             torch.cuda.empty_cache()
