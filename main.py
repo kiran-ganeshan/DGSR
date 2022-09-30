@@ -56,7 +56,7 @@ parser.add_argument("--port", type=str, default='29500', help='RPC Port')
 
 opt = parser.parse_args()
 args, extras = parser.parse_known_args()
-devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]     # get available devices
+devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count()) if i != 2]     # get available devices
 if len(devices) > opt.layer_num + 2:                                                # use at most layer_num + 2 devices
     devices = devices[:opt.layer_num + 2]
 device = devices[-1]                                                                # device to embed and predict on

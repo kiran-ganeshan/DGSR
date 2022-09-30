@@ -4,9 +4,8 @@ import torch.nn.functional as F
 from torch.distributed.pipeline.sync.skip import skippable, pop, stash
 from torch.distributed.pipeline.sync.pipe import PipeSequential
 
-def get_feat(bg, user, batch_idx, ntype, key='h', data=None):
-    if not data:
-        data = bg.nodes[ntype].data[key]
+def get_feat(bg, user, batch_idx, ntype):
+    data = bg.nodes[ntype].data['h']
     if ntype == 'user':
         num_nodes = bg.batch_num_nodes('user')
         tmp = torch.roll(torch.cumsum(num_nodes, 0), 1)

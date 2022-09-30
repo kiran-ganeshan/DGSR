@@ -175,18 +175,23 @@ def eval_metric(top, label, num_pos, ats=[5, 10, 20]):
     _, I = label.shape
     top = top[:, None, :]
     label = label[:, :, None]
-    ranks = torch.arange(K)[None, None, :].cuda()
-    cgs = 1. / torch.log2(ranks + 2)
-    matches = (top == label)
-    mask = (torch.arange(K)[None, None, :].cuda() < num_pos[:, None, None])
-    for at in ats:
-        cg = cgs[:, :, :at]
-        match = matches[:, :, :at]
-        m = mask[:, :, :at]
-        recalls[at] = (match.sum((1, 2)) / num_pos).mean()
-        ndcgs[at] = ((match * cg).sum((1, 2)) / (m * cg).sum((1, 2))).mean()
-    recalls = {f'recall@{at}': val.cpu().numpy().item() for at, val in recalls.items()}
-    ndcgs = {f'ndcg@{at}': val.cpu().numpy().item() for at, val in ndcgs.items()}
+    ranks = torch.arange(K)[None, :].cuda()
+    chunk_lens = [b - a for a, b in zip([0] + ats[:-1], ats)]
+    match = (top == label).sum(1)
+    cg = (1. / torch.log2(ranks + 2))
+    mask = torch.arange(K)[None, :].cuda() < num_pos[:, None]
+    def split_and_sum(x):
+        chunks = torch.split(x, chunk_lens, -1)
+        x = torch.stack([chunk.sum(-1) for chunk in chunks], -1)
+        x = torch.cumsum(x, -1)
+        return x
+    num_rel = split_and_sum(match)
+    dcg = split_and_sum(match * cg)
+    norm = split_and_sum(mask * cg)
+    recall = (num_rel / num_pos[:, None]).mean(0)
+    ndcg = (dcg / norm).mean(0)
+    recalls = {f'recall@{at}': recall[i].item() for i, at in enumerate(ats)}
+    ndcgs = {f'ndcg@{at}': ndcg[i].item() for i, at in enumerate(ats)}
     return {**recalls, **ndcgs}
 
 def get_topk_items(score, item_idx, target, num_target, k, neg_num=None):
@@ -198,7 +203,7 @@ def get_topk_items(score, item_idx, target, num_target, k, neg_num=None):
     erase_idx = torch.multinomial(erase_prob, num_erase)
     sample_score = torch.clone(score)
     for i in range(score.shape[0]):
-        sample_score[i, erase_idx[i, :]] = score[i, :].min()
+        sample_score[i, erase_idx[i, :]] = score[i, :].min() - 1.
     _, sample_top_item = torch.topk(sample_score, k, -1)
     return item_idx[top_item], item_idx[sample_top_item]
 
