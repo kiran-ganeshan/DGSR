@@ -59,10 +59,10 @@ class SamplingGraphData(GraphData):
         return self.size
         
 
-def user_neg(data, item_num):
-    all_item = range(item_num)
-    u_item = data.groupby('user_id')['item_id']
-    return u_item.apply(lambda x: np.setdiff1d(all_item, x))
+# def user_neg(data, item_num):
+#     all_item = range(item_num)
+#     u_item = data.groupby('user_id')['item_id']
+#     return u_item.apply(lambda x: np.setdiff1d(all_item, x))
 
 def multihot(label, num_target, item_num):
     T, _ = label.shape

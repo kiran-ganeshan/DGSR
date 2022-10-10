@@ -92,8 +92,7 @@ class DGNNEmbedding(nn.Module):
         
     def forward(self, g, user, idx):
         for ntype in g.ntypes:
-            id = g.nodes[ntype].data[ntype + '_id']
-            g.nodes[ntype].data['h'] = self.embeds[ntype](id)
+            g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes(ntype))
         for ntype in self.stack_ntypes:
             yield stash(ntype, get_feat(g, user, idx, ntype))
         if 'item' not in self.stack_ntypes:
@@ -145,7 +144,7 @@ class DGNNPredictor(nn.Module):
 
 class DGNNLayer(nn.Module):
     
-    def __init__(self, idx, etypes, stack_ntypes, hidden_size, max_lookback, layer_num, devices, feat_drop=0.2, attn_drop=0.2):
+    def __init__(self, idx, etypes, ntypes, stack_ntypes, hidden_size, max_lookback, layer_num, devices, feat_drop=0.2, attn_drop=0.2):
         super(DGNNLayer, self).__init__()
         self.hidden_size = hidden_size
         self.stack_ntypes = stack_ntypes
@@ -153,10 +152,11 @@ class DGNNLayer(nn.Module):
         self.device = devices[(idx * len(devices)) // layer_num]
         self.feat_drop = nn.Dropout(feat_drop)
         self.conv, self.reduce, self.update = {}, {}, {}
-        for srctype, etype, dsttype in etypes:
-            self.conv[srctype] = nn.Linear(hidden_size, hidden_size, bias=False)
+        for _, etype, _ in etypes:
             self.reduce[etype] = Reduce(etype, max_lookback, hidden_size, attn_drop)
-            self.update[dsttype] = Update(hidden_size)
+        for ntype in ntypes:
+            self.conv[ntype] = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.update[ntype] = Update(hidden_size)
         self.conv = nn.ModuleDict(self.conv)
         self.reduce = nn.ModuleDict(self.reduce)
         self.update = nn.ModuleDict(self.update)
@@ -168,12 +168,10 @@ class DGNNLayer(nn.Module):
         g = g.to(self.device)
         user = user.to(self.device)
         idx = idx.to(self.device)
-        feat_dict = {ntype: g.nodes[ntype].data['h'].to(device=self.device) for ntype in g.ntypes}
+        feat_dict = {}
         for ntype in g.ntypes:
-            # print(f'weight: {self.conv[ntype].weight.device}', flush=True)
-            # print(f'data  : {feat_dict[ntype].device}', flush=True)
-            # print(f'idx   : {self.idx}', flush=True)
-            feat_dict[ntype] = self.conv[ntype](self.feat_drop(feat_dict[ntype]))
+            feat_dict[ntype] = g.nodes[ntype].data['h'].to(device=self.device)
+            g.nodes[ntype].data['h'] = self.conv[ntype](self.feat_drop(feat_dict[ntype]))
         update_dict = {etype: (self.message, self.reduce[etype]) for etype in g.etypes}
         g.multi_update_all(update_dict, 'stack', self.cross_reduce)
         for ntype in g.ntypes:
@@ -185,14 +183,15 @@ class DGNNLayer(nn.Module):
 
 class DGNN(PipeSequential):
     
-    def __init__(self, etypes, num_nodes, hidden_size, max_lookback, embed_device, devices, feat_drop=0.2, 
-                 attn_drop=0.2, layer_num=3, use_item_feat = True):
+    def __init__(self, etypes, ntypes, num_nodes, hidden_size, max_lookback, 
+                 embed_device, devices, feat_drop=0.2, attn_drop=0.2, layer_num=3):
         self.layer_num = layer_num
-        stack_ntypes = ['user', 'item'] if use_item_feat else ['user']
+        stack_ntypes = ['user']
         
         # prepare arguments
         embed_args = (stack_ntypes, num_nodes, hidden_size)
-        args = (etypes, stack_ntypes, hidden_size, max_lookback, layer_num, devices, feat_drop, attn_drop)
+        args = (etypes, ntypes, stack_ntypes, hidden_size, max_lookback, 
+                layer_num, devices, feat_drop, attn_drop)
         pred_args = embed_args + (layer_num, embed_device)
         embed_args += (embed_device,)
         

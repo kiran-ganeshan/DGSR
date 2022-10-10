@@ -14,65 +14,24 @@ from utils import mkdir_if_not_exist, user_neg
 import datetime
 import os
 import pickle
+import itertools
 
-# Replace dataframe column values with relative order of values
-def remap_values(data, key):
-    user_ids = np.unique(data[key].values)
-    order = {k: v for k, v in zip(user_ids, range(len(user_ids)))}
-    reverse = {v: k for k, v in order.items()}
-    data = map_values(data, key, order)
-    return data, order, reverse
+def add_edges(srcntype, dstntype, etype, src_id, dst_id, data, graph_data=({}, {}, {})):
+    edges, edata, ndata = graph_data
+    edges[(srcntype, etype, dstntype)] = (torch.tensor(src_id), torch.tensor(dst_id))
+    edata[etype] = {key: torch.tensor(val).long() for key, val in data.items()}
+    return edges, edata, ndata
 
-def map_values(data, key, fwd):
-    data[key] = data[key].apply(lambda id: fwd[id])
-    return data
-
-def relabel_data(enroll, student, course):
-    enroll, u_fwd, u_rev = remap_values(enroll, 'user_id')
-    enroll, i_fwd, i_rev = remap_values(enroll, 'item_id')
-    student, _, m_rev = remap_values(student, 'major_id')
-    student, d_fwd, d_rev = remap_values(student, 'dept_id')
-    student = map_values(student, 'user_id', u_fwd)
-    course = map_values(course, 'item_id', i_fwd)
-    course = map_values(course, 'dept_id', d_fwd)
-    course = map_values(course, 'prereq_id', i_fwd)
-    return enroll, student, course, u_rev, i_rev, m_rev, d_rev
-
-def add_edges(srcntype, dstntype, fwdetype, revetype, src, dst, time, graph_data=({}, {})):
-    edata, times = graph_data
-    edata[(srcntype, fwdetype, dstntype)] = (torch.tensor(src), torch.tensor(dst))
-    edata[(dstntype, revetype, srcntype)] = (torch.tensor(dst), torch.tensor(src))
-    times[fwdetype] = torch.tensor(time).long()
-    times[revetype] = torch.tensor(time).long()
-    return edata, times
-
-def generate_graph(enroll, student, course, graph_repr=True):
-    user = enroll['user_id'].values
-    item = enroll['item_id'].values
-    time = enroll['time'].values
-    maj = student['major_id'].values
-    maj_u = student['user_id'].values
-    maj_dept = student['dept_id'].values
-    prereq = course['prereq_id'].values
-    prereq_i = course['item_id'].values
-    
-    graph_data = add_edges('user', 'item', 'sc', 'cs', user, item, time)
-    graph_data = add_edges('item', 'item', 'cp', 'pc', prereq_i, prereq, data=graph_data)
-    graph_data = add_edges('user', 'major', 'sm', 'ms', maj_u, maj, data=graph_data)
-    graph_data = add_edges('major', 'dept', 'md', 'dm', maj, maj_dept, data=graph_data)
-        
-    # course = pd.merge(pd.DataFrame({'item_id': np.unique(item)}), course, 'left', 'item_id')
-    # student = pd.merge(pd.DataFrame({'user_id': np.unique(user)}), student, 'left', 'user_id')
-    
-    edata, times = graph_data
-    graph = dgl.heterograph(edata)
-    for etype, time in times:
-        graph.edges[etype].data['time'] = time
-    graph.nodes['user'].data['user_id'] = torch.tensor(np.unique(user)).long()
-    graph.nodes['item'].data['item_id'] = torch.tensor(np.unique(item)).long()
-    #graph.nodes['item'].data['desc_h'] = SentenceTransformer(list(course['item_desc']))
-    graph.nodes['major'].data['major_id'] = torch.tensor(np.unique(maj)).long()
-    graph.nodes['dept'].data['dept_id'] = torch.tensor(np.unique(maj_dept)).long()
+def generate_graph(etypes, csvs):
+    for (srcntype, etype, dstntype), csv in zip(etypes, csvs):
+        src_id, dst_id = csv[f'{srcntype}_id'].values, csv[f'{dstntype}_id'].values
+        edata = {key: csv[key].values for key in ['time', 'semester']}
+        graph_data = add_edges(srcntype, dstntype, etype, src_id, dst_id, edata)
+    edges, edata = graph_data
+    graph = dgl.heterograph(edges)
+    for etype, data in edata.items():
+        for key, val in data.items():
+            graph.edges[etype].data[key] = val
     return graph
 
 def generate_data(enroll, graph, max_lookback, test_num, train_path, test_path, val_path):
@@ -134,52 +93,49 @@ def preprocess(opt, data_path):
     val_path = data_path + 'val/' if opt.val else None
     graph_path = data_path + 'graph'
     metadata_path = data_path + 'meta'
+    raw_path = './data/' + opt.data
     if os.path.exists(metadata_path):
         print("skipped preprocessing", flush=True)
         with open(metadata_path, 'rb') as file:
             metadata = pickle.load(file)
-            user_num = metadata['user_num']
-            item_num = metadata['item_num']
-            etypes = metadata['etypes']
-        return train_path, test_path, val_path, user_num, item_num, etypes
-    print('start preprocessing:', datetime.datetime.now(), flush=True)
-    for path in [data_path, train_path, test_path, val_path]:
-        if path:
-            mkdir_if_not_exist(path)
-    enroll = pd.read_csv('./data/' + opt.enroll + '.csv')
-    course = pd.read_csv('./data/' + opt.course + '.csv')
-    student = pd.read_csv('./data/' + opt.student + '.csv')
-    
-    # refine node indices
-    enroll, u_rev, i_rev = relabel_data(enroll, student, course)
-    
-    # metadata
-    metadata = {key + '_num': len(enroll[key + '_id'].unique()) for key in ['user', 'item']}
-    metadata = {**metadata, 'user_rev': u_rev, 'item_rev': i_rev}
-    
-    # graph
-    if not os.path.exists(graph_path):
-        graph = generate_graph(enroll)
-        dgl.save_graphs(graph_path, graph)
     else:
-        graph = dgl.load_graphs(graph_path)[0][0]
-    metadata = {**metadata, 'etypes': graph.canonical_etypes}
+        print('start preprocessing:', datetime.datetime.now(), flush=True)
+        assert os.path.exists(raw_path), f"raw data folder {raw_path} does not exist"
+        for path in [data_path, train_path, test_path, val_path]:
+            if path:
+                mkdir_if_not_exist(path)
         
-    # data
-    print('start data generation:', datetime.datetime.now(), flush=True)
-    path_args = (train_path, test_path, val_path)
-    train_num, val_num, test_num = generate_data(enroll, graph, opt.max_lookback, opt.item_num, *path_args)
-    
-    # save metadata (last to indicate completion)
-    with open(metadata_path, 'wb') as file:
-        pickle.dump(metadata, file)
-    user_num = metadata['user_num']
-    item_num = metadata['item_num']
-    etypes = metadata['etypes']
+        csv_names = os.listdir(raw_path)
+        csv_names.sort()
+        from_ntypes, to_ntypes = zip(*[name.split('_') for name in csv_names])
+        to_ntypes = [name.split('.')[0] for name in to_ntypes]
+        ntypes = np.unique(from_ntypes + to_ntypes).tolist()
+        from_to = itertools.chain(zip(from_ntypes, to_ntypes), zip(to_ntypes, from_ntypes))
+        etypes = [(f, f[0] + t[0], t) for f, t in from_to]
+        csvs = [pd.read_csv(data_path + file) for file in csv_names]
         
-    print('The number of train set: ', train_num // opt.batch_size, flush=True)
-    print('The number of val set: ', val_num // opt.batch_size, flush=True)
-    print('The number of test set: ', test_num // opt.batch_size, flush=True)
-    print('End preprocessing: ', datetime.datetime.now(), flush=True)
-    return train_path, test_path, val_path, user_num, item_num, etypes
+        # metadata
+        metadata = {'etypes': etypes, 'ntypes': ntypes}
+        metadata['num_nodes'] = {ntype: graph.num_nodes(ntype) for ntype in ntypes}
+        
+        # graph
+        graph = generate_graph(etypes, csvs)
+        dgl.save_graphs(graph_path, graph)
+            
+        # data
+        print('start data generation:', datetime.datetime.now(), flush=True)
+        enroll_csv = [csv for csv, etype in zip(csvs, etypes) if etype[1] == 'ui'][0]
+        path_args = (train_path, test_path, val_path)
+        train_num, val_num, test_num = generate_data(enroll_csv, graph, opt.max_lookback, 
+                                                     metadata['num_nodes']['item'], *path_args)
+        
+        # save metadata (last to indicate completion)
+        with open(metadata_path, 'wb') as file:
+            pickle.dump(metadata, file)
+            
+        print('The number of train set: ', train_num // opt.batch_size, flush=True)
+        print('The number of val set: ', val_num // opt.batch_size, flush=True)
+        print('The number of test set: ', test_num // opt.batch_size, flush=True)
+        print('End preprocessing: ', datetime.datetime.now(), flush=True)
+    return train_path, test_path, val_path, metadata['num_nodes'], metadata['etypes'], metadata['ntypes']
 
