@@ -83,13 +83,9 @@ class DGNNEmbedding(nn.Module):
                  hidden_size : int, 
                  sampling : bool = False):
         super(DGNNEmbedding, self).__init__()
-        self.embeds = nn.ModuleDict({ntype: nn.Embedding(n, hidden_size) for ntype, n in num_nodes.items()})
+        
         
     def forward(self, g, user):
-        for ntype in g.ntypes:
-            g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes(ntype))
-        yield stash('user', g.nodes[ntype].data['h'][user, ...])
-        yield stash('item_embed', self.embeds['item'].weight)
         return g, user
         
 
@@ -100,7 +96,7 @@ class DGNNPredictor(nn.Module):
                  hidden_size : int, 
                  layer_num : int):
         super(DGNNPredictor, self).__init__()
-        self.unified_map = nn.Linear((layer_num + 1) * hidden_size, hidden_size)
+        
         self.ntypes = num_nodes.keys()
         self.layer_num = layer_num
         self.item_num = num_nodes['item']
@@ -155,7 +151,7 @@ class DGNNLayer(nn.Module):
         return g, user
 
 
-class DGNN(PipeSequential):
+class DGNN(nn.Module):
     
     def __init__(self, 
                  etypes : list[EType], 
@@ -163,42 +159,18 @@ class DGNN(PipeSequential):
                  num_nodes : dict[str, int], 
                  hidden_size : int, 
                  max_lookback : int, 
-                 embed_device : DeviceObjType, 
-                 devices : list[DeviceObjType], 
+                 device : DeviceObjType, 
                  feat_drop : float = 0.2, 
                  attn_drop : float = 0.2, 
                  layer_num : int = 3):
-        self.layer_num = layer_num
-        
-        # prepare layer classes
-        clss = [DGNNEmbedding] + layer_num * [DGNNLayer] + [DGNNPredictor]
-        
-        
-        # prepare arguments
-        args = [(num_nodes, hidden_size)]
-        args.extend([(i, etypes, ntypes, hidden_size, 
-                      max_lookback, feat_drop, attn_drop) 
-                     for i in range(layer_num)])
-        args.append(args[0] + (layer_num,))
-        
-        # prepare skip tensor names
-        skips = [{'stash': ['user', 'item_embed']}]
-        skips.extend([{'stash': ['user' + str(i)]} for i in range(layer_num)])
-        skips.append({'pop': [name for dict in skips for name in dict['stash']]})
-        
         # prepare layers
-        layers_per_device = math.ceil(layer_num / len(devices))
-        devices = [embed_device] + devices + [embed_device]
-        layers = [skippable(**skip)(cls)(*arg) if len(skip) > 0 else cls(*arg)
-                  for cls, skip, arg in zip(clss, skips, args)]
-        layers = chunk_list(layers, layers_per_device, prefix=1, suffix=1)
-        layers = [[layer.to(device=device) for layer in lst] for lst, device in zip(layers, devices)]
-        for layer, device in zip(layers, devices):
-            layer.insert(0, ChangeDevice(device))
-        layers = unchunk_list(layers)
+        args = [(num_nodes, hidden_size, i, etypes, ntypes, 
+                 hidden_size, max_lookback, feat_drop, attn_drop)]
+        self.layers = nn.Sequential([DGNNLayer(*arg) for _ in range(layer_num)])
+        self.embeds = nn.ModuleDict({ntype: nn.Embedding(n, hidden_size) for ntype, n in num_nodes.items()})
+        self.unified_map = nn.Linear((layer_num + 1) * hidden_size, hidden_size)
         
         # construct DGNN
-        super(DGNN, self).__init__(*tuple(layers))
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -206,6 +178,11 @@ class DGNN(PipeSequential):
         for weight in self.parameters():
             if weight.dim() > 1:
                 nn.init.xavier_normal_(weight, gain=gain)
+                
+    def forward(self, g, user):
+        for ntype in g.ntypes:
+            g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes(ntype))
+        g, user = self.layers(g, user)
                 
                 
 class ChangeDevice(WithDevice):
