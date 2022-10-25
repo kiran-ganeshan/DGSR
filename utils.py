@@ -152,30 +152,31 @@ def get_collate(item_num, max_items, max_users, k_hop, train=True, sampling=Fals
     return collate
 
 def eval_metric(top, label, num_target, ats=[5, 10, 20]):
-    recalls = {at: [] for at in ats}
-    ndcgs = {at: ([], []) for at in ats}
-    B, K = top.shape
-    _, I = label.shape
+    _, K = top.shape
     top = top[:, None, :]
     label = label[:, :, None]
     num_pos = num_target[:, None]
-    ranks = torch.arange(K)[None, :].cuda()
     chunk_lens = [b - a for a, b in zip([0] + ats[:-1], ats)]
     match = (top == label).sum(1)
-    cg = (1. / torch.log2(ranks + 2))
-    mask = ranks < num_pos
     def split_and_sum(x):
         chunks = torch.split(x, chunk_lens, -1)
         x = torch.stack([chunk.sum(-1) for chunk in chunks], -1)
         x = torch.cumsum(x, -1)
         return x
-    num_rel = split_and_sum(match)
-    dcg = split_and_sum(match * cg)
-    norm = split_and_sum(mask * cg)
-    recall = (num_rel / num_pos).mean(0)
-    ndcg = (dcg / norm).mean(0)
-    recalls = {f'recall@{at}': recall[i].item() for i, at in enumerate(ats)}
-    ndcgs = {f'ndcg@{at}': ndcg[i].item() for i, at in enumerate(ats)}
+    def get_recalls():
+        num_rel = split_and_sum(match)
+        recall = (num_rel / num_pos).mean(0)
+        return {f'recall@{at}': recall[i].item() for i, at in enumerate(ats)}
+    def get_precisions():
+        ranks = torch.arange(K)[None, :].cuda()
+        cg = (1. / torch.log2(ranks + 2))
+        mask = ranks < num_pos
+        dcg = split_and_sum(match * cg)
+        norm = split_and_sum(mask * cg)
+        ndcg = (dcg / norm).mean(0)
+        return {f'ndcg@{at}': ndcg[i].item() for i, at in enumerate(ats)}
+    recalls = get_recalls()
+    ndcgs = get_precisions()
     return {**recalls, **ndcgs}
 
 def get_topk_items(score, target, num_target, k, neg_num=None):
