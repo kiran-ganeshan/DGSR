@@ -1,25 +1,16 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed.pipeline.sync.skip import skippable, pop, stash
-from torch.distributed.pipeline.sync.pipe import PipeSequential
+from torch import DeviceObjType
+from torch.distributed.pipeline.sync.pipe import PipeSequential, WithDevice
+from torch.distributed.pipeline.sync.skip import pop, skippable, stash
+from dgl._ffi.base import DGLError
 
-def get_feat(bg, user, batch_idx, ntype):
-    data = bg.nodes[ntype].data['h']
-    if ntype == 'user':
-        num_nodes = bg.batch_num_nodes('user')
-        tmp = torch.roll(torch.cumsum(num_nodes, 0), 1)
-        tmp[0] = 0
-        idx = tmp[batch_idx] + user
-        return data[idx]
-    else:
-        return data
+from utils import chunk_list, unchunk_list
 
-def get_batch_mask(bg, user_batch_idx, device=None):
-    item_batch_idx = torch.cat([torch.full((n,), i, device=device) 
-                                for i, n in enumerate(bg.batch_num_nodes('item'))])
-    return (user_batch_idx[:, None] == item_batch_idx[None, :]).to(dtype=torch.float)
-
+EType = tuple[str, str, str]
 
 class Update(nn.Module):
     
@@ -29,35 +20,43 @@ class Update(nn.Module):
         
     def forward(self, user_new, user_old):
         return F.tanh(self.rnn_weight(torch.cat([user_new, user_old], -1)))
-
+    
+class SimpleReduce(nn.Module):
+    
+    def forward(self, nodes):
+        src = nodes.mailbox['h']
+        dst = nodes.mailbox['k']
 
 class Reduce(nn.Module):
     
     def __init__(self, etype, max_lookback, hidden_size, attn_drop):
         super(Reduce, self).__init__()
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
+        # self.key = nn.Linear(hidden_size, hidden_size)
+        # self.query = nn.Linear(hidden_size, hidden_size)
+        # self.value = nn.Linear(hidden_size, hidden_size)
         self.atten_drop = nn.Dropout(attn_drop)
         self.norm_const = torch.sqrt(torch.tensor(hidden_size).float())
         self.max_lookback = max_lookback
-        self.encode_time = (etype in ['sc', 'cs'])
+        self.encode_time = (etype in ['ui', 'iu'])
         if self.encode_time:
-            self.key_embed = nn.Embedding(max_lookback, hidden_size)
-            self.val_embed = nn.Embedding(max_lookback, hidden_size)
+            self.key_embed = nn.Embedding(3, hidden_size)
+            self.val_embed = nn.Embedding(3, hidden_size)
 
     def forward(self, nodes):
         src = nodes.mailbox['h']
         dst = nodes.mailbox['k']
-        query = self.query(dst)
-        key = self.key(src)
-        val = self.value(src)
+        query = dst
+        key = src
+        val = src
+        # query = self.query(dst)
+        # key = self.key(src)
+        # val = self.value(src)
         if self.encode_time:
-            pred_time = nodes.mailbox['predict_time']
-            time = nodes.mailbox['time']
-            re_order = pred_time - time - 1
-            key_embed = self.key_embed(re_order)
-            val_embed = self.val_embed(re_order)
+            #pred_time = nodes.mailbox['predict_time']
+            time = nodes.mailbox['semester']
+            #re_order = pred_time - time - 1
+            key_embed = self.key_embed(time)
+            val_embed = self.val_embed(time)
             key = key + key_embed
             val = val + val_embed
         e_ij = torch.sum(key * query, dim=2) / self.norm_const
@@ -80,76 +79,56 @@ class CrossReduce(nn.Module):
 class DGNNEmbedding(nn.Module):
     
     def __init__(self, 
-                 stack_ntypes : dict, 
                  num_nodes : dict, 
                  hidden_size : int, 
-                 device : torch.DeviceObjType,
                  sampling : bool = False):
         super(DGNNEmbedding, self).__init__()
-        self.stack_ntypes = stack_ntypes
         self.embeds = nn.ModuleDict({ntype: nn.Embedding(n, hidden_size) for ntype, n in num_nodes.items()})
-        self.to(device=device)
         
-    def forward(self, g, user, idx):
+    def forward(self, g, user):
         for ntype in g.ntypes:
             g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes(ntype))
-        for ntype in self.stack_ntypes:
-            yield stash(ntype, get_feat(g, user, idx, ntype))
-        if 'item' not in self.stack_ntypes:
-            yield stash('item_embed', self.embeds['item'].weight)
-        return g, user, idx
+        yield stash('user', g.nodes[ntype].data['h'][user, ...])
+        yield stash('item_embed', self.embeds['item'].weight)
+        return g, user
         
 
 class DGNNPredictor(nn.Module):
     
     def __init__(self, 
-                 stack_ntypes : list, 
                  num_nodes : int, 
                  hidden_size : int, 
-                 layer_num : int, 
-                 device : torch.DeviceObjType):
+                 layer_num : int):
         super(DGNNPredictor, self).__init__()
-        self.unified_maps = nn.ModuleDict({ntype: nn.Linear((layer_num + 1) * hidden_size, hidden_size) 
-                                           for ntype in stack_ntypes})
-        self.stack_ntypes = stack_ntypes
+        self.unified_map = nn.Linear((layer_num + 1) * hidden_size, hidden_size)
+        self.ntypes = num_nodes.keys()
         self.layer_num = layer_num
         self.item_num = num_nodes['item']
-        self.device = device
-        self.to(device=self.device)
         
-    def forward(self, g, user, idx):
-        # item_embed /= torch.norm(self.embeds['item'].weight, dim=-1)[..., None]
-        g = g.to(self.device)
-        idx = idx.to(self.device)
-        feat_dict = {}
-        for ntype in self.stack_ntypes:
-            feat_dict[ntype] = yield pop(ntype)
-            for i in range(self.layer_num):
-                next_embed = yield pop(ntype + str(i))
-                feat_dict[ntype] = torch.cat([feat_dict[ntype], next_embed], -1)
-        feat_dict = {ntype: self.unified_maps[ntype](feat) for ntype, feat in feat_dict.items()}
-        if 'item' in feat_dict:
-            item_feat = feat_dict['item']
-            item_idx = g.nodes['item'].data['item_id']
-        else:
-            item_feat = yield pop('item_embed')
-            item_idx = torch.arange(self.item_num, device=self.device)
-        score = feat_dict['user'] @ item_feat.transpose(0, 1)
-        if 'item' in feat_dict:
-            score *= get_batch_mask(g, idx, self.device)
-            return score, item_idx
-        else:
-            return score
+    def forward(self, g, user):
+        user_h = yield pop('user')
+        for i in range(self.layer_num):
+            next_embed = yield pop('user' + str(i))
+            user_h = torch.cat([user_h, next_embed], -1)
+        user_h = self.unified_map(user_h)
+        item_feat = yield pop('item_embed')
+        score = user_h @ item_feat.transpose(0, 1)
+        return score
     
 
 class DGNNLayer(nn.Module):
     
-    def __init__(self, idx, etypes, ntypes, stack_ntypes, hidden_size, max_lookback, layer_num, devices, feat_drop=0.2, attn_drop=0.2):
+    def __init__(self, 
+                 idx : int, 
+                 etypes : list[EType], 
+                 ntypes : list[str], 
+                 hidden_size : int, 
+                 max_lookback : int, 
+                 feat_drop : float, 
+                 attn_drop : float):
         super(DGNNLayer, self).__init__()
         self.hidden_size = hidden_size
-        self.stack_ntypes = stack_ntypes
         self.idx = idx
-        self.device = devices[(idx * len(devices)) // layer_num]
         self.feat_drop = nn.Dropout(feat_drop)
         self.conv, self.reduce, self.update = {}, {}, {}
         for _, etype, _ in etypes:
@@ -162,55 +141,61 @@ class DGNNLayer(nn.Module):
         self.update = nn.ModuleDict(self.update)
         self.cross_reduce = CrossReduce()
         self.message = lambda e: {**e.data, 'h': e.src['h'], 'k': e.dst['h']}
-        self.to(device=self.device)
 
-    def forward(self, g, user, idx):
-        g = g.to(self.device)
-        user = user.to(self.device)
-        idx = idx.to(self.device)
+    def forward(self, g, user):
         feat_dict = {}
         for ntype in g.ntypes:
-            feat_dict[ntype] = g.nodes[ntype].data['h'].to(device=self.device)
+            feat_dict[ntype] = g.nodes[ntype].data['h']
             g.nodes[ntype].data['h'] = self.conv[ntype](self.feat_drop(feat_dict[ntype]))
         update_dict = {etype: (self.message, self.reduce[etype]) for etype in g.etypes}
         g.multi_update_all(update_dict, 'stack', self.cross_reduce)
         for ntype in g.ntypes:
             g.nodes[ntype].data['h'] = self.update[ntype](g.nodes[ntype].data['h'], feat_dict[ntype])
-        for ntype in self.stack_ntypes:
-            yield stash(ntype + str(self.idx), get_feat(g, user, idx, ntype))
-        return g, user, idx
+        yield stash('user' + str(self.idx), g.nodes[ntype].data['h'][user, ...])
+        return g, user
 
 
 class DGNN(PipeSequential):
     
-    def __init__(self, etypes, ntypes, num_nodes, hidden_size, max_lookback, 
-                 embed_device, devices, feat_drop=0.2, attn_drop=0.2, layer_num=3):
+    def __init__(self, 
+                 etypes : list[EType], 
+                 ntypes : list[int], 
+                 num_nodes : dict[str, int], 
+                 hidden_size : int, 
+                 max_lookback : int, 
+                 embed_device : DeviceObjType, 
+                 devices : list[DeviceObjType], 
+                 feat_drop : float = 0.2, 
+                 attn_drop : float = 0.2, 
+                 layer_num : int = 3):
         self.layer_num = layer_num
-        stack_ntypes = ['user']
-        
-        # prepare arguments
-        embed_args = (stack_ntypes, num_nodes, hidden_size)
-        args = (etypes, ntypes, stack_ntypes, hidden_size, max_lookback, 
-                layer_num, devices, feat_drop, attn_drop)
-        pred_args = embed_args + (layer_num, embed_device)
-        embed_args += (embed_device,)
-        
-        # prepare skip tensor names
-        embed_skip = stack_ntypes.copy()
-        if 'item' not in stack_ntypes:
-            embed_skip.append('item_embed')
-        layer_skip = lambda i: [ntype + str(i) for ntype in stack_ntypes]
-        all_skip = embed_skip + [name for i in range(0, self.layer_num) for name in layer_skip(i)]
         
         # prepare layer classes
-        get_layer_cls = lambda i: skippable(stash=layer_skip(i))(DGNNLayer)
-        embed_cls = skippable(stash=embed_skip)(DGNNEmbedding)
-        predict_cls = skippable(pop=all_skip)(DGNNPredictor)
+        clss = [DGNNEmbedding] + layer_num * [DGNNLayer] + [DGNNPredictor]
         
-        # construct layer list
-        layers = [embed_cls(*embed_args)]
-        layers.extend([get_layer_cls(i)(i, *args) for i in range(0, layer_num)])
-        layers.append(predict_cls(*pred_args))
+        
+        # prepare arguments
+        args = [(num_nodes, hidden_size)]
+        args.extend([(i, etypes, ntypes, hidden_size, 
+                      max_lookback, feat_drop, attn_drop) 
+                     for i in range(layer_num)])
+        args.append(args[0] + (layer_num,))
+        
+        # prepare skip tensor names
+        skips = [{'stash': ['user', 'item_embed']}]
+        skips.extend([{'stash': ['user' + str(i)]} for i in range(layer_num)])
+        skips.append({'pop': [name for dict in skips for name in dict['stash']]})
+        
+        # prepare layers
+        layers_per_device = math.ceil(layer_num / len(devices))
+        devices = [embed_device] + devices + [embed_device]
+        layers = [skippable(**skip)(cls)(*arg) if len(skip) > 0 else cls(*arg)
+                  for cls, skip, arg in zip(clss, skips, args)]
+        layers = chunk_list(layers, layers_per_device, prefix=1, suffix=1)
+        layers = [[layer.to(device=device) for layer in lst] for lst, device in zip(layers, devices)]
+        for layer, device in zip(layers, devices):
+            layer.insert(0, ChangeDevice(device))
+        layers = unchunk_list(layers)
         
         # construct DGNN
         super(DGNN, self).__init__(*tuple(layers))
@@ -221,3 +206,23 @@ class DGNN(PipeSequential):
         for weight in self.parameters():
             if weight.dim() > 1:
                 nn.init.xavier_normal_(weight, gain=gain)
+                
+                
+class ChangeDevice(WithDevice):
+    
+    class MultiIdentity(nn.Module):
+        
+        def __init__(self, device):
+            super(ChangeDevice.MultiIdentity, self).__init__()
+            self.device = device
+    
+        def forward(self, *args):
+            g, *others = args
+            g = g.to(self.device)  
+            return g, *others
+            # return tuple(a.to(device=self.device) if i != 0 else a.to(self.device) 
+            #             for i, a in enumerate(args))
+    
+    def __init__(self, device):
+        super(ChangeDevice, self).__init__(self.MultiIdentity(device), device)   
+                     

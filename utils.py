@@ -5,13 +5,15 @@
 # @File : utils.py
 # @Software: PyCharm
 import os
-from torch.utils.data import Dataset
-import dgl
-from dgl.sampling import sample_neighbors
-import torch
-import numpy as np
-from torch.nn.functional import one_hot
 from bisect import bisect_right as bisect
+
+import dgl
+import numpy as np
+import torch
+from dgl.sampling import sample_neighbors
+from torch.nn.functional import one_hot
+from torch.utils.data import Dataset
+
 
 class GraphData(Dataset):
     
@@ -57,12 +59,6 @@ class SamplingGraphData(GraphData):
     
     def __len__(self):
         return self.size
-        
-
-# def user_neg(data, item_num):
-#     all_item = range(item_num)
-#     u_item = data.groupby('user_id')['item_id']
-#     return u_item.apply(lambda x: np.setdiff1d(all_item, x))
 
 def multihot(label, num_target, item_num):
     T, _ = label.shape
@@ -70,6 +66,12 @@ def multihot(label, num_target, item_num):
     for t in range(T):
         target[t, :] = one_hot(label[t, :num_target[t]], num_classes=item_num).float().sum(-2)
     return target
+
+def get_batched_user(user, graphs, batch_idx):
+    past_nodes = torch.cumsum(graphs.batch_num_nodes('user'), 0)
+    past_nodes = torch.roll(past_nodes, 1)
+    past_nodes[0] = 0
+    return user + past_nodes[batch_idx]
 
 def pad(label, item_num):
     B, I = label.shape
@@ -123,63 +125,45 @@ def subsample(graph, user, max_items, max_users, k):
     user = torch.where(user[:, None] == khop.nodes['user'].data[dgl.NID][None, :])[1]
     return khop, user
     
-def get_collate(item_num, max_items, max_users, k_hop, 
-                train=True, margin=False, sampling=False, multiplier=1):
-    
+def get_collate(item_num, max_items, max_users, k_hop, train=True, sampling=False):
     def collate(data):
-        # gather data (and subsample graphs if necessary)
         user, batch_idxs, graphs, label, num_target = [], [], [], [], []
         for i, (graph, labels) in enumerate(data):
             u = labels['users'].long()
-            # if len(u.shape) > 1:
-            #     u = u.squeeze(-1)
             if sampling:
-                samples = [subsample(graph, u, max_items, max_users, k_hop) for _ in range(multiplier)]
-                graph, u = zip(*samples)
+                graph, u = subsample(graph, u, max_items, max_users, k_hop)
                 u = torch.cat(u)
-                batch_idx = i * multiplier + torch.arange(u.shape[0])
             else:
                 graph = [graph]
-                batch_idx = torch.full_like(u, i)
             user.append(u)
             graphs.extend(graph)
             label.append(labels['items'])
             num_target.append(labels['num_items'])
-            batch_idxs.append(batch_idx)
-        # batch and move to torch
-        # print([u.shape for u in user], flush=True)
-        # print([i.shape for i in batch_idxs], flush=True)
-        # print([l.shape for l in label], flush=True)
+            batch_idxs.append(torch.full_like(u, i))
         user = torch.cat(user).long()
         batch_idx = torch.cat(batch_idxs).long()
         graphs = dgl.batch(graphs)
         label = torch.cat(label).long()
         num_target = torch.cat(num_target).long()
-        # multihot-encode target and sample remaining users
-        if margin:
-            target = pad(label, item_num)
-        else:
-            target = multihot(label, num_target, item_num)
-        # duplicate users/targets if using multiple graph samples
-        if sampling and multiplier != 1:
-            target = target.repeat(multiplier, 1)
-        # return results
+        user = get_batched_user(user, graphs, batch_idx)
+        target = multihot(label, num_target, item_num)
         test_ex = () if train else (label, num_target) 
-        return graphs, user, batch_idx, target, *test_ex
+        return graphs, user, target, *test_ex
     return collate
 
-def eval_metric(top, label, num_pos, ats=[5, 10, 20]):
+def eval_metric(top, label, num_target, ats=[5, 10, 20]):
     recalls = {at: [] for at in ats}
     ndcgs = {at: ([], []) for at in ats}
     B, K = top.shape
     _, I = label.shape
     top = top[:, None, :]
     label = label[:, :, None]
+    num_pos = num_target[:, None]
     ranks = torch.arange(K)[None, :].cuda()
     chunk_lens = [b - a for a, b in zip([0] + ats[:-1], ats)]
     match = (top == label).sum(1)
     cg = (1. / torch.log2(ranks + 2))
-    mask = torch.arange(K)[None, :].cuda() < num_pos[:, None]
+    mask = ranks < num_pos
     def split_and_sum(x):
         chunks = torch.split(x, chunk_lens, -1)
         x = torch.stack([chunk.sum(-1) for chunk in chunks], -1)
@@ -188,13 +172,13 @@ def eval_metric(top, label, num_pos, ats=[5, 10, 20]):
     num_rel = split_and_sum(match)
     dcg = split_and_sum(match * cg)
     norm = split_and_sum(mask * cg)
-    recall = (num_rel / num_pos[:, None]).mean(0)
+    recall = (num_rel / num_pos).mean(0)
     ndcg = (dcg / norm).mean(0)
     recalls = {f'recall@{at}': recall[i].item() for i, at in enumerate(ats)}
     ndcgs = {f'ndcg@{at}': ndcg[i].item() for i, at in enumerate(ats)}
     return {**recalls, **ndcgs}
 
-def get_topk_items(score, item_idx, target, num_target, k, neg_num=None):
+def get_topk_items(score, target, num_target, k, neg_num=None):
     _, top_item = torch.topk(score, k, -1)
     if neg_num is None:
         return top_item
@@ -205,9 +189,24 @@ def get_topk_items(score, item_idx, target, num_target, k, neg_num=None):
     for i in range(score.shape[0]):
         sample_score[i, erase_idx[i, :]] = score[i, :].min() - 1.
     _, sample_top_item = torch.topk(sample_score, k, -1)
-    return item_idx[top_item], item_idx[sample_top_item]
+    return top_item, sample_top_item
 
 def mkdir_if_not_exist(file_name):
     dir_name = os.path.dirname(file_name)
     if not os.path.isdir(dir_name):
         os.makedirs(dir_name)
+        
+def unchunk_list(lst):
+    return [item for chunk in lst for item in chunk]
+        
+def chunk_list(lst, chunk_size, prefix=0, suffix=0):
+    def _chunk(lst, chunk_size):
+        end = len(lst) - suffix
+        if prefix > 0:
+            yield lst[:prefix]
+        for i in range(prefix, end, chunk_size):
+            yield lst[i:min(i + chunk_size, end)]
+        if suffix > 0:
+            yield lst[-suffix:]
+    return list(_chunk(lst, chunk_size))
+        

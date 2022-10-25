@@ -5,39 +5,37 @@
 # @File : new_main
 # @Software: PyCharm
 
-import datetime
-import torch
-import pandas as pd
-import numpy as np
-from DGNN import DGNN
-import dgl
-import pickle
-from utils import SamplingGraphData, GraphData
-import warnings
 import argparse
+import datetime
 import os
+import pickle
 import sys
-from torch.utils.data import DataLoader
-from torch.distributed.pipeline.sync import Pipe
-from torch.distributed import rpc
-import torch.optim as optim
-import torch.nn as nn
-from utils import eval_metric, mkdir_if_not_exist, get_collate, get_topk_items
-from preprocess import preprocess
+import warnings
 
+import dgl
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributed import rpc
+from torch.distributed.pipeline.sync import Pipe
+from torch.utils.data import DataLoader
+
+from DGNN import DGNN
+from preprocess import preprocess
+from utils import (GraphData, SamplingGraphData, eval_metric, get_collate,
+                   get_topk_items, mkdir_if_not_exist)
 
 warnings.filterwarnings('ignore')
 parser = argparse.ArgumentParser()
 parser.add_argument('--data', default='Enrollments', help='data name: sample')
 parser.add_argument('--load', type=str, default=None, help='past model to load (default: from scratch)')
 parser.add_argument('--batch_size', type=int, default=1, help='input batch size')
-parser.add_argument('--multiplier', type=int, default=1, help='Number of graph samples per bucket (only applies if --sampling)')
 parser.add_argument('--hidden_size', type=int, default=50, help='hidden state size')
 parser.add_argument("--test_num", type=int, default=4, help='Number of test times')
 parser.add_argument("--k_hop", type=int, default=3, help='Number of hops in preprocessing')
-parser.add_argument("--margin", action='store_true', default=False, help='Use multilabel margin loss')
 parser.add_argument("--sampling", action='store_true', default=False, help='Whether to subsample input graphs')
-parser.add_argument("--use_item_feat", action='store_true', default=False, help='Whether to use the item input embedding to calculate scores')
 parser.add_argument("--pos_weight", type=float, default=1.0, help='Weighting on positive examples')
 parser.add_argument("--max_users", type=int, default=25, help='Maximum number of sampled users per hop')
 parser.add_argument("--max_items", type=int, default=25, help='Maximum number of sampled items per hop')
@@ -56,7 +54,7 @@ parser.add_argument("--port", type=str, default='29500', help='RPC Port')
 
 opt = parser.parse_args()
 args, extras = parser.parse_known_args()
-devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count()) if i != 2]     # get available devices
+devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]     # get available devices
 if len(devices) > opt.layer_num + 2:                                                # use at most layer_num + 2 devices
     devices = devices[:opt.layer_num + 2]
 device = devices[-1]                                                                # device to embed and predict on
@@ -73,8 +71,6 @@ data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.val}"
 run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_l2{opt.l2}_pw{opt.pos_weight}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}"
 if opt.sampling:
     run_id += f"_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
-run_id += '_' + ('margin' if opt.margin else 'bce')
-run_id += '_' + ('feat' if opt.use_item_feat else 'embed')
 if opt.run_id:
     run_id = opt.run_id + '_' + run_id
 data_path = 'static/' + data_id + '/'
@@ -85,50 +81,49 @@ results_path = data_path + run_id + '/'
 mkdir_if_not_exist(results_path)
 model_file = results_path + 'model'
 sys.stdout = open(out_file, 'w+')
-train_path, test_path, val_path, user_num, item_num, etypes = preprocess(opt, data_path)
+train_path, test_path, val_path, num_nodes, etypes, ntypes = preprocess(opt, data_path)
 Dataset = SamplingGraphData if opt.sampling else GraphData
 train_set = Dataset(train_path)
 test_set = Dataset(test_path)
 if opt.val:
     val_set = Dataset(val_path)
 
-batch_size = opt.batch_size // (opt.multiplier if opt.sampling else 1)
-find_num_batches = lambda size: size // batch_size + (size % batch_size > 0)
+find_num_batches = lambda size: size // opt.batch_size + (size % opt.batch_size > 0)
 find_log_freq = lambda n, k: 1 if n < k else 2 * find_log_freq(n / 2, k)     # log freq so that we log at least k/2 and at most k times
 train_num = find_num_batches(train_set.size)
 test_num = find_num_batches(test_set.size)
 train_log_freq = find_log_freq(train_num, 20)
 test_log_freq = find_log_freq(test_num, 10)
-print('train number: ', train_num)
-print('test number: ', test_num)
-print('user number: ', user_num)
-print('item number: ', item_num)
-collate = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, True,
-                      opt.margin, opt.sampling, opt.multiplier)
-collate_test = get_collate(item_num, opt.max_users, opt.max_items, opt.k_hop, False,
-                           opt.margin, opt.sampling, opt.multiplier)
+print('number of training batches: ', train_num)
+print('number of testing batches: ', test_num)
+for ntype in ntypes:
+    print(f'{ntype} number: ', num_nodes[ntype])
+collate = get_collate(num_nodes['item'], opt.max_users, opt.max_items, 
+                      opt.k_hop, True, opt.sampling)
+collate_test = get_collate(num_nodes['item'], opt.max_users, opt.max_items, 
+                           opt.k_hop, False, opt.sampling)
 train_data = DataLoader(dataset=train_set, 
-                        batch_size=batch_size, 
+                        batch_size=opt.batch_size, 
                         collate_fn=collate, 
                         shuffle=True, 
                         pin_memory=True, 
                         num_workers=30)
 test_data = DataLoader(dataset=test_set, 
-                       batch_size=batch_size, 
+                       batch_size=opt.batch_size, 
                        collate_fn=collate_test, 
                        shuffle=True, 
                        pin_memory=True, 
                        num_workers=12)
 if opt.val:
     val_data = DataLoader(dataset=val_set, 
-                          batch_size=opt.batch_size // opt.multiplier, 
+                          batch_size=opt.batch_size, 
                           collate_fn=collate_test, 
                           pin_memory=True, 
                           num_workers=2)
 
 # initialize the model
-args = (etypes, {'user': user_num, 'item': item_num}, opt.hidden_size, opt.max_lookback, 
-        device, devices, opt.feat_drop, opt.attn_drop, opt.layer_num, opt.use_item_feat)
+args = (etypes, ntypes, num_nodes, opt.hidden_size, opt.max_lookback, device, devices, 
+        opt.feat_drop, opt.attn_drop, opt.layer_num)
 model = Pipe(DGNN(*args), min(opt.batch_size, 8), 'never')
 # model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
 #              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
@@ -136,9 +131,7 @@ if opt.load:
     state = torch.load(data_path + 'model_' + opt.load)
     model.load_state_dict(state)
 optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.l2)
-Loss = nn.MultiLabelMarginLoss if opt.margin else nn.BCEWithLogitsLoss
-kwargs = {} if opt.margin else {'pos_weight': torch.tensor(opt.pos_weight)}
-loss_func = Loss(reduction='mean', **kwargs).to(device)
+loss_func = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=torch.tensor(opt.pos_weight)).to(device)
 best = {}
 stop_num = 0
 epoch_start = None
@@ -149,7 +142,6 @@ for epoch in range(opt.epoch):
     val_loss = 0
     test_loss = 0
     iter = 0
-    
     ############################ train ############################
     curr_time = datetime.datetime.now()
     if epoch_start is not None:
@@ -158,18 +150,14 @@ for epoch in range(opt.epoch):
     print('start training: ', curr_time)
     epoch_start = curr_time
     model.train()
-    for batch_graph, user, batch_idx, target in train_data:
+    for batch_graph, user, target in train_data:
         iter += 1
         batch_graph = batch_graph.to(device)
         user = user.cuda()
-        batch_idx = batch_idx.cuda()
         target = target.cuda()
-        if opt.use_item_feat:
-            score, item_idx = model(batch_graph, user, batch_idx).local_value()
-        else:
-            score = model(batch_graph, user, batch_idx).local_value()
-            item_idx = torch.arange(item_num, device=device)
-        loss = loss_func(score, target[:, item_idx])
+        # print(user.device, batch_idx.device, target.device)
+        score = model(batch_graph, user).local_value()
+        loss = loss_func(score, target)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -180,7 +168,7 @@ for epoch in range(opt.epoch):
         torch.cuda.empty_cache()
     epoch_loss /= iter
     ###############################################################
-
+    print([torch.norm(embed) for name, embed in model[1].named_parameters() if name == 'module.embeds.item.weight'], flush=True)
     ############################ val ##############################
     model.eval()
     iter = 0
@@ -189,24 +177,17 @@ for epoch in range(opt.epoch):
         top_items, sample_top_items, num_targets, labels = [], [], [], []
         ats = [5, 10, 20]
         with torch.no_grad:
-            for batch_graph, user, batch_idx, target, label, num_target in val_data:
+            for batch_graph, user, target, label, num_target in val_data:
                 iter += 1
                 batch_graph = batch_graph.to(device)
                 user = user.cuda()
-                batch_idx = batch_idx.cuda()
                 target = target.cuda()
                 label = label.cuda()
                 num_target = num_target.cuda()
-                if opt.use_item_feat:
-                    score, item_idx = model(batch_graph, user, batch_idx).local_value()
-                else:
-                    score = model(batch_graph, user, batch_idx).local_value()
-                    item_idx = torch.arange(item_num, device=device)
-                target = target[:, item_idx]
+                score = model(batch_graph, user).local_value()
                 loss = loss_func(score, target)
                 val_loss += loss.detach().cpu().item()
-                # score = score.reshape(-1, opt.multiplier, item_num).mean(1)
-                top, sample_top = get_topk_items(score, item_idx, target, num_target, max(ats), opt.neg_num)
+                top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
                 top_items.append(top)
                 sample_top_items.append(sample_top)
                 num_targets.append(num_target)
@@ -231,24 +212,17 @@ for epoch in range(opt.epoch):
     iter = 0
     ats = [5, 10, 20]
     with torch.no_grad():
-        for batch_graph, user, batch_idx, target, label, num_target in test_data:
+        for batch_graph, user, target, label, num_target in test_data:
             iter += 1
             batch_graph = batch_graph.to(device)
             user = user.cuda()
-            batch_idx = batch_idx.cuda()
             target = target.cuda()
             label = label.cuda()
             num_target = num_target.cuda()
-            if opt.use_item_feat:
-                score, item_idx = model(batch_graph, user, batch_idx).local_value()
-            else:
-                score = model(batch_graph, user, batch_idx).local_value()
-                item_idx = torch.arange(item_num, device=device)
-            target = target[:, item_idx]
+            score = model(batch_graph, user).local_value()
             loss = loss_func(score, target)
             test_loss += loss.detach().cpu().item()
-            # score = score.reshape(-1, opt.multiplier, item_num).mean(1)
-            top, sample_top = get_topk_items(score, item_idx, target, num_target, max(ats), opt.neg_num)
+            top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
             top_items.append(top)
             sample_top_items.append(sample_top)
             num_targets.append(num_target)
@@ -277,6 +251,7 @@ for epoch in range(opt.epoch):
         stop_num += 1
     else:
         stop_num = 0
+
     
     ###############################################################
     print(f"max memory allocated: {torch.cuda.max_memory_allocated() / 1e9:.4f}")
