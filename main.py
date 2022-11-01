@@ -50,19 +50,11 @@ parser.add_argument('--max_lookback', type=int, default=12, help='maximum lookba
 parser.add_argument("--val", action='store_true', default=False)
 parser.add_argument("--nosave", action='store_true', default=False, help='model and outputs not saved')
 parser.add_argument("--run_id", type=str, default='', help='Additional identifier for run (outside of hparams)')
-parser.add_argument("--port", type=str, default='29500', help='RPC Port')
+parser.add_argument("--device", type=int, default=3, help='Device to Use')
 
 opt = parser.parse_args()
-args, extras = parser.parse_known_args()
-devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]     # get available devices
-if len(devices) > opt.layer_num + 2:                                                # use at most layer_num + 2 devices
-    devices = devices[:opt.layer_num + 2]
-device = devices[-1]                                                                # device to embed and predict on
-devices = devices[:-1]                                                              # devices to compute graph layers on
-torch.cuda.set_device(device)                                                       # redirect .cuda() to correct device
-os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = opt.port
-rpc.init_rpc('worker', rank=0, world_size=1)
+device = torch.device(f'cuda:{opt.device}')
+torch.cuda.set_device(device) 
 print(f"devices: {devices}")
 print(f"opt: {opt}")
 
