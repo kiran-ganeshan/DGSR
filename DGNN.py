@@ -3,9 +3,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import DeviceObjType
-from torch.distributed.pipeline.sync.pipe import PipeSequential, WithDevice
-from torch.distributed.pipeline.sync.skip import pop, skippable, stash
 from dgl._ffi.base import DGLError
 
 from utils import chunk_list, unchunk_list
