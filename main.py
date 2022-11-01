@@ -55,11 +55,11 @@ parser.add_argument("--device", type=int, default=3, help='Device to Use')
 opt = parser.parse_args()
 device = torch.device(f'cuda:{opt.device}')
 torch.cuda.set_device(device) 
-print(f"devices: {devices}")
+print(f"devices: {device}")
 print(f"opt: {opt}")
 
 # loading data (and preprocessing if necessary)
-data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.val}"
+data_id = f"{opt.data}_{opt.test_num}_{opt.max_lookback}_{opt.val}_nopipe"
 run_id = f"bs{opt.batch_size}_lr{opt.lr}_ep{opt.epoch}_l2{opt.l2}_pw{opt.pos_weight}_ft{opt.feat_drop}_at{opt.attn_drop}_ln{opt.layer_num}_hs{opt.hidden_size}"
 if opt.sampling:
     run_id += f"_mu{opt.max_users}_mi{opt.max_items}_k{opt.k_hop}"
@@ -155,7 +155,7 @@ for epoch in range(opt.epoch):
         torch.cuda.empty_cache()
     epoch_loss /= iter
     ###############################################################
-    print([torch.norm(embed) for name, embed in model[1].named_parameters() if name == 'module.embeds.item.weight'], flush=True)
+    print([torch.norm(embed) for name, embed in model.named_parameters() if name == 'module.embeds.item.weight'], flush=True)
     ############################ val ##############################
     model.eval()
     iter = 0

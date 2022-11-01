@@ -79,7 +79,6 @@ class CrossReduce(nn.Module):
 class DGNNLayer(nn.Module):
     
     def __init__(self, 
-                 idx : int, 
                  etypes : list[EType], 
                  ntypes : list[str], 
                  hidden_size : int, 
@@ -88,7 +87,6 @@ class DGNNLayer(nn.Module):
                  attn_drop : float):
         super(DGNNLayer, self).__init__()
         self.hidden_size = hidden_size
-        self.idx = idx
         self.feat_drop = nn.Dropout(feat_drop)
         self.conv, self.reduce, self.update = {}, {}, {}
         for _, etype, _ in etypes:
@@ -102,7 +100,7 @@ class DGNNLayer(nn.Module):
         self.cross_reduce = CrossReduce()
         self.message = lambda e: {**e.data, 'h': e.src['h'], 'k': e.dst['h']}
 
-    def forward(self, g, user):
+    def forward(self, g):
         feat_dict = {}
         for ntype in g.ntypes:
             feat_dict[ntype] = g.nodes[ntype].data['h']
@@ -111,8 +109,7 @@ class DGNNLayer(nn.Module):
         g.multi_update_all(update_dict, 'stack', self.cross_reduce)
         for ntype in g.ntypes:
             g.nodes[ntype].data['h'] = self.update[ntype](g.nodes[ntype].data['h'], feat_dict[ntype])
-        yield stash('user' + str(self.idx), g.nodes[ntype].data['h'][user, ...])
-        return g, user
+        return g
 
 
 class DGNN(nn.Module):
@@ -127,9 +124,10 @@ class DGNN(nn.Module):
                  feat_drop : float = 0.2, 
                  attn_drop : float = 0.2, 
                  layer_num : int = 3):
+        super(DGNN, self).__init__()
+        
         # prepare layers
-        args = [(num_nodes, hidden_size, i, etypes, ntypes, 
-                 hidden_size, max_lookback, feat_drop, attn_drop)]
+        args = (etypes, ntypes, hidden_size, max_lookback, feat_drop, attn_drop)
         self.layers = nn.ModuleList([DGNNLayer(*args) for _ in range(layer_num)])
         self.embeds = nn.ModuleDict({ntype: nn.Embedding(n, hidden_size) for ntype, n in num_nodes.items()})
         self.unified_map = nn.Linear((layer_num + 1) * hidden_size, hidden_size)
@@ -146,11 +144,12 @@ class DGNN(nn.Module):
     def forward(self, g, user):
         for ntype in g.ntypes:
             g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes(ntype))
-        user_h = g.nodes['user'].data['h']
-        item_h = g.nodes['item'].data['h']
+        user_h = g.nodes['user'].data['h'][user, ...]
+        item_h = self.embeds['item'].weight
         for layer in self.layers:
-            g, user = self.layer(g, user)
-            user_h = torch.cat([user_h, g.nodes['user'].data['h']], -1)
+            g = layer(g)
+            layer_h = g.nodes['user'].data['h'][user, ...]
+            user_h = torch.cat([user_h, layer_h], -1)
         user_h = self.unified_map(user_h)
         return user_h @ item_h.transpose(0, 1)
                      
