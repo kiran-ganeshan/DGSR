@@ -74,42 +74,6 @@ class CrossReduce(nn.Module):
         if h.dim() > 2:
             h = h.sum(-2)
         return {'h': h}
-
-
-class DGNNEmbedding(nn.Module):
-    
-    def __init__(self, 
-                 num_nodes : dict, 
-                 hidden_size : int, 
-                 sampling : bool = False):
-        super(DGNNEmbedding, self).__init__()
-        
-        
-    def forward(self, g, user):
-        return g, user
-        
-
-class DGNNPredictor(nn.Module):
-    
-    def __init__(self, 
-                 num_nodes : int, 
-                 hidden_size : int, 
-                 layer_num : int):
-        super(DGNNPredictor, self).__init__()
-        
-        self.ntypes = num_nodes.keys()
-        self.layer_num = layer_num
-        self.item_num = num_nodes['item']
-        
-    def forward(self, g, user):
-        user_h = yield pop('user')
-        for i in range(self.layer_num):
-            next_embed = yield pop('user' + str(i))
-            user_h = torch.cat([user_h, next_embed], -1)
-        user_h = self.unified_map(user_h)
-        item_feat = yield pop('item_embed')
-        score = user_h @ item_feat.transpose(0, 1)
-        return score
     
 
 class DGNNLayer(nn.Module):
@@ -166,7 +130,7 @@ class DGNN(nn.Module):
         # prepare layers
         args = [(num_nodes, hidden_size, i, etypes, ntypes, 
                  hidden_size, max_lookback, feat_drop, attn_drop)]
-        self.layers = nn.Sequential([DGNNLayer(*arg) for _ in range(layer_num)])
+        self.layers = nn.ModuleList([DGNNLayer(*args) for _ in range(layer_num)])
         self.embeds = nn.ModuleDict({ntype: nn.Embedding(n, hidden_size) for ntype, n in num_nodes.items()})
         self.unified_map = nn.Linear((layer_num + 1) * hidden_size, hidden_size)
         
@@ -182,24 +146,11 @@ class DGNN(nn.Module):
     def forward(self, g, user):
         for ntype in g.ntypes:
             g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes(ntype))
-        g, user = self.layers(g, user)
-                
-                
-class ChangeDevice(WithDevice):
-    
-    class MultiIdentity(nn.Module):
-        
-        def __init__(self, device):
-            super(ChangeDevice.MultiIdentity, self).__init__()
-            self.device = device
-    
-        def forward(self, *args):
-            g, *others = args
-            g = g.to(self.device)  
-            return g, *others
-            # return tuple(a.to(device=self.device) if i != 0 else a.to(self.device) 
-            #             for i, a in enumerate(args))
-    
-    def __init__(self, device):
-        super(ChangeDevice, self).__init__(self.MultiIdentity(device), device)   
+        user_h = g.nodes['user'].data['h']
+        item_h = g.nodes['item'].data['h']
+        for layer in self.layers:
+            g, user = self.layer(g, user)
+            user_h = torch.cat([user_h, g.nodes['user'].data['h']], -1)
+        user_h = self.unified_map(user_h)
+        return user_h @ item_h.transpose(0, 1)
                      

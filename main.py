@@ -114,11 +114,7 @@ if opt.val:
                           num_workers=2)
 
 # initialize the model
-args = (etypes, ntypes, num_nodes, opt.hidden_size, opt.max_lookback, device, devices, 
-        opt.feat_drop, opt.attn_drop, opt.layer_num)
-model = Pipe(DGNN(*args), min(opt.batch_size, 8), 'never')
-# model = DGSR(user_num=user_num, item_num=item_num, input_dim=opt.hidden_size, max_lookback=opt.max_lookback, 
-#              feat_drop=opt.feat_drop, attn_drop=opt.attn_drop, layer_num=opt.layer_num).cuda()
+model = DGNN(etypes, ntypes, num_nodes, opt.hidden_size, opt.max_lookback, device, opt.feat_drop, opt.attn_drop, opt.layer_num).cuda()
 if opt.load:
     state = torch.load(data_path + 'model_' + opt.load)
     model.load_state_dict(state)
@@ -147,8 +143,7 @@ for epoch in range(opt.epoch):
         batch_graph = batch_graph.to(device)
         user = user.cuda()
         target = target.cuda()
-        # print(user.device, batch_idx.device, target.device)
-        score = model(batch_graph, user).local_value()
+        score = model(batch_graph, user)
         loss = loss_func(score, target)
         optimizer.zero_grad()
         loss.backward()
@@ -176,7 +171,7 @@ for epoch in range(opt.epoch):
                 target = target.cuda()
                 label = label.cuda()
                 num_target = num_target.cuda()
-                score = model(batch_graph, user).local_value()
+                score = model(batch_graph, user)
                 loss = loss_func(score, target)
                 val_loss += loss.detach().cpu().item()
                 top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
@@ -211,7 +206,7 @@ for epoch in range(opt.epoch):
             target = target.cuda()
             label = label.cuda()
             num_target = num_target.cuda()
-            score = model(batch_graph, user).local_value()
+            score = model(batch_graph, user)
             loss = loss_func(score, target)
             test_loss += loss.detach().cpu().item()
             top, sample_top = get_topk_items(score, target, num_target, max(ats), opt.neg_num)
