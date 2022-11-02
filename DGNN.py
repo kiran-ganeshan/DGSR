@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import DeviceObjType
 from dgl._ffi.base import DGLError
 
 from utils import chunk_list, unchunk_list

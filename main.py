@@ -84,6 +84,7 @@ find_num_batches = lambda size: size // opt.batch_size + (size % opt.batch_size 
 find_log_freq = lambda n, k: 1 if n < k else 2 * find_log_freq(n / 2, k)     # log freq so that we log at least k/2 and at most k times
 train_num = find_num_batches(train_set.size)
 test_num = find_num_batches(test_set.size)
+
 train_log_freq = find_log_freq(train_num, 20)
 test_log_freq = find_log_freq(test_num, 10)
 print('number of training batches: ', train_num)
@@ -118,6 +119,8 @@ model = DGNN(etypes, ntypes, num_nodes, opt.hidden_size, opt.max_lookback, devic
 if opt.load:
     state = torch.load(data_path + 'model_' + opt.load)
     model.load_state_dict(state)
+param_count = sum(p.numel() for p in model.parameters())
+print('number of parameters: ', param_count)
 optimizer = optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.l2)
 loss_func = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=torch.tensor(opt.pos_weight)).to(device)
 best = {}
@@ -155,7 +158,7 @@ for epoch in range(opt.epoch):
         torch.cuda.empty_cache()
     epoch_loss /= iter
     ###############################################################
-    print([torch.norm(embed) for name, embed in model.named_parameters() if name == 'module.embeds.item.weight'], flush=True)
+    print([torch.norm(embed) for name, embed in model.named_parameters() if name == 'embeds.item.weight'], flush=True)
     ############################ val ##############################
     model.eval()
     iter = 0
