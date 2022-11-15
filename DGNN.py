@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import DeviceObjType
-from dgl._ffi.base import DGLError
+from dgl import NID
 
 from utils import chunk_list, unchunk_list
 
@@ -141,13 +141,16 @@ class DGNN(nn.Module):
                 
     def forward(self, g, user):
         for ntype in g.ntypes:
-            g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes(ntype))
+            g.nodes[ntype].data['h'] = self.embeds[ntype](g.nodes[ntype].data[NID])
+        item_h = g.nodes['item'].data['h']
+        item_id = g.nodes['item'].data[NID]
         user_h = g.nodes['user'].data['h'][user, ...]
-        item_h = self.embeds['item'].weight
+        # item_h = self.embeds['item'].weight
+        # item_id = torch.arange(item_h.shape[1]).long()
         for layer in self.layers:
             g = layer(g)
             layer_h = g.nodes['user'].data['h'][user, ...]
             user_h = torch.cat([user_h, layer_h], -1)
         user_h = self.unified_map(user_h)
-        return user_h @ item_h.transpose(0, 1)
+        return user_h @ item_h.transpose(0, 1), item_id
                      

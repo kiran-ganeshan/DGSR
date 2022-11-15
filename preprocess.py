@@ -66,8 +66,6 @@ def generate_data(enroll, graph, max_lookback, test_num, train_path, test_path, 
     keys = ['users', 'items', 'num_items']
     enroll = enroll.apply(lambda r: pd.Series([list(r[k]) for k in keys], index=keys)) 
         
-    perm_edges = {key: graph.edges[key].data['time'] < 0 for key in graph.etypes}
-    past_users = dgl.edge_subgraph(graph, perm_edges).nodes('user')
     for t, row in enroll.iterrows():
         # construct subgraph
         to_keep = lambda etype: torch.ones(graph.num_edges(etype)).long() if 'u' not in etype else (
@@ -102,7 +100,7 @@ def generate_data(enroll, graph, max_lookback, test_num, train_path, test_path, 
 def preprocess(opt, data_path):
     train_path = data_path + 'train/'
     test_path = data_path + 'test/'
-    val_path = data_path + 'val/' if opt.val else None
+    val_path = data_path + 'val/'
     graph_path = data_path + 'graph'
     metadata_path = data_path + 'meta'
     raw_path = './data/' + opt.data
@@ -142,5 +140,7 @@ def preprocess(opt, data_path):
         print('The number of val set: ', val_num, flush=True)
         print('The number of test set: ', test_num, flush=True)
         print('End preprocessing: ', datetime.datetime.now(), flush=True)
-    return train_path, test_path, val_path, metadata['num_nodes'], metadata['etypes'], metadata['ntypes']
+    splits = ['train', 'val', 'test']
+    paths = {'train': train_path, 'test': test_path, 'val': val_path}
+    return splits, paths, metadata['num_nodes'], metadata['etypes'], metadata['ntypes']
 

@@ -67,11 +67,13 @@ def multihot(label, num_target, item_num):
         target[t, :] = one_hot(label[t, :num_target[t]], num_classes=item_num).float().sum(-2)
     return target
 
-def get_batched_user(user, graphs, batch_idx):
-    past_nodes = torch.cumsum(graphs.batch_num_nodes('user'), 0)
+def get_batched_user(user, batch_sizes):
+    past_nodes = torch.cumsum(batch_sizes, 0)
     past_nodes = torch.roll(past_nodes, 1)
-    past_nodes[0] = 0
-    return user + past_nodes[batch_idx]
+    batch_idx = torch.zeros((past_nodes[0],), dtype=torch.long)
+    batch_idx[past_nodes[1:]] = 1
+    batch_idx = torch.cumsum(batch_idx, 0)
+    return user + batch_idx
 
 def pad(label, item_num):
     B, I = label.shape
@@ -119,7 +121,7 @@ def subsample(graph, user, max_items, max_users, k):
         for ntype in graph.ntypes:
             new_nodes[ntype] = torch.tensor(np.setdiff1d(new_nodes[ntype], nodes[ntype]))
             nodes[ntype] = torch.unique(torch.cat([new_nodes[ntype], nodes[ntype]]))
-    khop = dgl.edge_subgraph(graph, edges)
+    khop = dgl.edge_subgraph(graph, edges, store_ids=False)
     if khop.num_nodes('user') == 0:
         khop = dgl.add_nodes(khop, 1, {dgl.NID: user}, 'user')
     user = torch.where(user[:, None] == khop.nodes['user'].data[dgl.NID][None, :])[1]
@@ -127,7 +129,7 @@ def subsample(graph, user, max_items, max_users, k):
     
 def get_collate(item_num, max_items, max_users, k_hop, train=True, sampling=False):
     def collate(data):
-        user, batch_idxs, graphs, label, num_target = [], [], [], [], []
+        user, graphs, label, num_target, batch_sizes = [], [], [], [], []
         for i, (graph, labels) in enumerate(data):
             u = labels['users'].long()
             if sampling:
@@ -135,17 +137,17 @@ def get_collate(item_num, max_items, max_users, k_hop, train=True, sampling=Fals
                 u = torch.cat(u)
             else:
                 graph = [graph]
+            batch_sizes.append(torch.tensor([u.shape[0]]).long())
             user.append(u)
             graphs.extend(graph)
             label.append(labels['items'])
             num_target.append(labels['num_items'])
-            batch_idxs.append(torch.full_like(u, i))
+        batch_sizes = torch.cat(batch_sizes).long()
         user = torch.cat(user).long()
-        batch_idx = torch.cat(batch_idxs).long()
         graphs = dgl.batch(graphs)
         label = torch.cat(label).long()
         num_target = torch.cat(num_target).long()
-        user = get_batched_user(user, graphs, batch_idx)
+        user = get_batched_user(user, batch_sizes)
         target = multihot(label, num_target, item_num)
         test_ex = () if train else (label, num_target) 
         return graphs, user, target, *test_ex
@@ -168,7 +170,7 @@ def eval_metric(top, label, num_target, ats=[5, 10, 20]):
         recall = (num_rel / num_pos).mean(0)
         return {f'recall@{at}': recall[i].item() for i, at in enumerate(ats)}
     def get_precisions():
-        ranks = torch.arange(K)[None, :].cuda()
+        ranks = torch.arange(K)[None, :]
         cg = (1. / torch.log2(ranks + 2))
         mask = ranks < num_pos
         dcg = split_and_sum(match * cg)
@@ -179,18 +181,18 @@ def eval_metric(top, label, num_target, ats=[5, 10, 20]):
     ndcgs = get_precisions()
     return {**recalls, **ndcgs}
 
-def get_topk_items(score, target, num_target, k, neg_num=None):
-    _, top_item = torch.topk(score, k, -1)
+def get_topk_items(score, item, target, num_target, k, neg_num=None):
+    _, top_idx = torch.topk(score, k, -1)
     if neg_num is None:
-        return top_item
+        return item[top_idx]
     num_erase = score.shape[1] - num_target.max() - neg_num
     erase_prob = torch.max(torch.tensor(0.), 1. - target)
     erase_idx = torch.multinomial(erase_prob, num_erase)
     sample_score = torch.clone(score)
     for i in range(score.shape[0]):
         sample_score[i, erase_idx[i, :]] = score[i, :].min() - 1.
-    _, sample_top_item = torch.topk(sample_score, k, -1)
-    return top_item, sample_top_item
+    _, sample_top_idx = torch.topk(sample_score, k, -1)
+    return item[top_idx], item[sample_top_idx]
 
 def mkdir_if_not_exist(file_name):
     dir_name = os.path.dirname(file_name)
