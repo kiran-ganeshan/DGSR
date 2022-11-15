@@ -133,8 +133,8 @@ def step(graph, user, target, label=None, num_target=None):
 best = {}
 epoch_start = None
 for epoch in range(opt.epoch):
-    
     # timing
+    print('=' * 30 + f'epoch {epoch}' + '=' * 30)
     curr_time = datetime.datetime.now()
     if epoch_start is not None:
         print('last epoch time: ', curr_time - epoch_start)
