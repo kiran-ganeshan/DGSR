@@ -146,11 +146,13 @@ class DGNN(nn.Module):
         item_id = g.nodes['item'].data[NID]
         user_h = g.nodes['user'].data['h'][user, ...]
         # item_h = self.embeds['item'].weight
-        # item_id = torch.arange(item_h.shape[1]).long()
+        # item_id = torch.arange(item_h.shape[0]).long()
         for layer in self.layers:
             g = layer(g)
             layer_h = g.nodes['user'].data['h'][user, ...]
             user_h = torch.cat([user_h, layer_h], -1)
         user_h = self.unified_map(user_h)
+        # item_h = g.nodes['item'].data['h']
+        # item_id = g.nodes['item'].data[NID]
         return user_h @ item_h.transpose(0, 1), item_id
                      
