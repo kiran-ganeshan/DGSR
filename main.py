@@ -154,7 +154,7 @@ for epoch in range(opt.epoch):
             iter += 1
             loss, top, sample_top = step(*data)
             if iter % log_freqs[split] == 0:
-                print('\tIter {}, loss {:.4f}'.format(iter, loss / iter), datetime.datetime.now(), flush=True)
+                print('\tIter {}, loss {:.4f}'.format(iter, loss / iter), datetime.datetime.now())
             total_loss += loss
             if not train:
                 *others, label, num_target = data
@@ -171,7 +171,7 @@ for epoch in range(opt.epoch):
             for name, top in zip(["true", "sampling"], [top_item, sample_top_item]):
                 results = eval_metric(top, label, num_target, ats)
                 results_str = '\n\t\t'.join([f"{metric_name}: {val:.4f}" for metric_name, val in results.items()])
-                print(f"\t{name} results:\n\t\t" + results_str, flush=True)
+                print(f"\t{name} results:\n\t\t" + results_str)
         if split == 'test':
             for metric_name, val in results.items():
                 if metric_name not in best or val > best[metric_name][0]:
@@ -181,7 +181,7 @@ for epoch in range(opt.epoch):
                     file_add = '' if metric_name == 'recall@10' else f'_{metric_name}'
                     torch.save(model.state_dict(), model_file + file_add)
         
-    print([torch.norm(embed) for name, embed in model.named_parameters() if name == 'embeds.item.weight'], flush=True)
+    print([torch.norm(embed) for name, embed in model.named_parameters() if name == 'embeds.item.weight'])
     print(f"max memory allocated: {torch.cuda.max_memory_allocated() / 1e9:.4f}")
     print(f"max memory reserved: {torch.cuda.max_memory_reserved() / 1e9:.4f}")
     print(f"max memory cached: {torch.cuda.max_memory_cached() / 1e9:.4f}")
