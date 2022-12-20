@@ -9,6 +9,6 @@ Research codebase based on the TKDE 2022 paper: Dynamic Graph Neural Networks fo
 
 ## Usage 
 
-Simply run `new_main.py`. It will do all preprocessing necessary and save preprocessing results for future runs.
+Simply run `main.py`. It will do all preprocessing necessary and save preprocessing results for future runs.
 
 
